@@ -37,6 +37,7 @@ import {
   failValidation,
 } from '../tasks.js';
 import { createEvidenceBundle, type RuntimeEvidenceBundle } from '../evidence.js';
+import type { RuntimeProductAdapter } from './runtimeAdapter.js';
 
 /** SafeCommit's P1.0 advisory verdict — human-readable, no false trust. */
 export type SafeCommitVerdict = 'GREEN' | 'YELLOW' | 'RED';
@@ -228,6 +229,22 @@ export function buildSafeCommitEvidenceBundle(
 ): RuntimeEvidenceBundle {
   return createEvidenceBundle(mapAdvisoryContractToRuntimeTask(input, options));
 }
+
+/**
+ * SafeCommit's adapter, exposed as a `RuntimeProductAdapter` object so generic
+ * runtime tooling (`runProductAdapter`, future adapter registries) can drive
+ * it the same way as any other product's adapter. This is additive: the
+ * free functions above (`mapAdvisoryContractToRuntimeTask`,
+ * `buildSafeCommitEvidenceBundle`) remain the primary exports and are simply
+ * reused as this object's methods.
+ */
+export const safeCommitAdapter: RuntimeProductAdapter<SafeCommitAdvisoryContractInput> = {
+  id: 'safecommit-advisory-adapter',
+  product: 'safecommit',
+  version: '1.0.0',
+  mapToRuntimeTask: (input) => mapAdvisoryContractToRuntimeTask(input),
+  buildEvidenceBundle: (input) => buildSafeCommitEvidenceBundle(input),
+};
 
 /** Deterministic GREEN fixture, structurally identical to a real ADVISORY_CONTRACT.json. */
 export const SAMPLE_ADVISORY_CONTRACT: SafeCommitAdvisoryContractInput = {

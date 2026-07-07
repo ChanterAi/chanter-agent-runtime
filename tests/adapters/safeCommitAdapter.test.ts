@@ -4,9 +4,12 @@ import {
   mapAdvisoryContractToRuntimeTask,
   buildSafeCommitEvidenceBundle,
   mapSafeCommitRiskLevel,
+  safeCommitAdapter,
   SAMPLE_ADVISORY_CONTRACT,
 } from '../../src/adapters/safeCommitAdapter.js';
 import type { SafeCommitAdvisoryContractInput } from '../../src/adapters/safeCommitAdapter.js';
+import type { RuntimeProductAdapter } from '../../src/adapters/runtimeAdapter.js';
+import { runProductAdapter } from '../../src/adapters/runtimeAdapter.js';
 import { assertJsonSafe, approveTask, startExecution, startValidation, failValidation, failTask } from '../../src/index.js';
 
 function contract(overrides: Partial<SafeCommitAdvisoryContractInput> = {}): SafeCommitAdvisoryContractInput {
@@ -132,5 +135,37 @@ describe('mapAdvisoryContractToRuntimeTask: no validation configured', () => {
     assert.strictEqual(task.status, 'completed');
     assert.strictEqual(task.validationResult?.checks.length, 1);
     assert.strictEqual(task.validationResult?.checks[0].command, 'safecommit-advisory-verdict');
+  });
+});
+
+describe('safeCommitAdapter: conforms to RuntimeProductAdapter', () => {
+  it('exposes id/product/version and the two mapping methods', () => {
+    assert.strictEqual(safeCommitAdapter.id, 'safecommit-advisory-adapter');
+    assert.strictEqual(safeCommitAdapter.product, 'safecommit');
+    assert.strictEqual(typeof safeCommitAdapter.version, 'string');
+    assert.strictEqual(typeof safeCommitAdapter.mapToRuntimeTask, 'function');
+    assert.strictEqual(typeof safeCommitAdapter.buildEvidenceBundle, 'function');
+
+    // Structural check: assigning to the generic interface type must type-check.
+    const typed: RuntimeProductAdapter<SafeCommitAdvisoryContractInput> = safeCommitAdapter;
+    assert.strictEqual(typed.id, safeCommitAdapter.id);
+  });
+
+  it('mapToRuntimeTask matches the behavior of mapAdvisoryContractToRuntimeTask', () => {
+    const viaAdapter = safeCommitAdapter.mapToRuntimeTask(contract());
+    assert.strictEqual(viaAdapter.status, 'completed');
+    assert.strictEqual(viaAdapter.product, 'safecommit');
+  });
+
+  it('buildEvidenceBundle matches the behavior of buildSafeCommitEvidenceBundle', () => {
+    const bundle = safeCommitAdapter.buildEvidenceBundle(contract());
+    assert.strictEqual(bundle.status, 'completed');
+    assert.doesNotThrow(() => assertJsonSafe(bundle));
+  });
+
+  it('can be driven generically through runProductAdapter', () => {
+    const result = runProductAdapter(safeCommitAdapter, { input: contract() });
+    assert.strictEqual(result.task.product, 'safecommit');
+    assert.strictEqual(result.task.id, result.evidenceBundle.taskId);
   });
 });

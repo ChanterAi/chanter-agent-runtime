@@ -18,6 +18,7 @@ import type {
   RuntimeTask,
   RuntimeValidationResult,
 } from './types.js';
+import { redactJsonValue, redactText } from './redaction.js';
 
 /** Slimmed event entry — drops taskId (redundant with the bundle's own taskId) and any extra data payload. */
 export interface RuntimeEventSummary {
@@ -92,6 +93,42 @@ function summarizeEvent(event: RuntimeEvent): RuntimeEventSummary {
   return { type: event.type, timestamp: event.timestamp, message: event.message };
 }
 
+/**
+ * Redacts the specific fields of an evidence item that may carry free-form,
+ * caller-supplied content. Applied again here (on top of the redaction
+ * already done when the evidence was attached, see tasks.ts) so this export
+ * boundary is safe even if a task was assembled by hand rather than driven
+ * through the lifecycle functions.
+ */
+function redactEvidenceForExport(item: RuntimeEvidence): RuntimeEvidence {
+  return {
+    ...item,
+    detail: redactText(item.detail),
+    ...(item.source !== undefined ? { source: redactText(item.source) } : {}),
+  };
+}
+
+function redactValidationResultForExport(result: RuntimeValidationResult): RuntimeValidationResult {
+  return {
+    ...result,
+    checks: result.checks.map((check) => ({
+      ...check,
+      ...(check.message !== undefined ? { message: redactText(check.message) } : {}),
+    })),
+  };
+}
+
+function redactResultForExport(result: RuntimeResult): RuntimeResult {
+  return {
+    ...result,
+    ...(result.output !== undefined ? { output: redactJsonValue(result.output) } : {}),
+  };
+}
+
+function redactRecommendationForExport(recommendation: RuntimeRecommendation): RuntimeRecommendation {
+  return { ...recommendation, reason: redactText(recommendation.reason) };
+}
+
 /** Builds the compact, JSON-safe evidence bundle described in the runtime contract. */
 export function createEvidenceBundle(task: RuntimeTask): RuntimeEvidenceBundle {
   const bundle: RuntimeEvidenceBundle = {
@@ -103,12 +140,12 @@ export function createEvidenceBundle(task: RuntimeTask): RuntimeEvidenceBundle {
     status: task.status,
     approvalRequired: task.approvalRequired,
     planSummary: task.plan?.summary ?? null,
-    evidence: task.evidence.map((item) => ({ ...item })),
+    evidence: task.evidence.map(redactEvidenceForExport),
     validationCommands: [...task.validationCommands],
-    validationResult: task.validationResult ? { ...task.validationResult } : null,
-    result: task.result ? { ...task.result } : null,
+    validationResult: task.validationResult ? redactValidationResultForExport(task.validationResult) : null,
+    result: task.result ? redactResultForExport(task.result) : null,
     eventLogSummary: task.logs.map(summarizeEvent),
-    nextRecommendation: task.nextRecommendation ? { ...task.nextRecommendation } : null,
+    nextRecommendation: task.nextRecommendation ? redactRecommendationForExport(task.nextRecommendation) : null,
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
     generatedAt: new Date().toISOString(),
@@ -168,5 +205,7 @@ export function summarizeTaskForReview(task: RuntimeTask): RuntimeReviewSummary 
     lines.push(`Recommendation: ${task.nextRecommendation.action} — ${task.nextRecommendation.reason}`);
   }
 
-  return { text: lines.join('\n'), fields };
+  // Defensive re-redaction of the assembled text block — same rationale as
+  // createEvidenceBundle: safe even if a task's fields were set by hand.
+  return { text: redactText(lines.join('\n')), fields };
 }

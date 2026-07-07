@@ -24,6 +24,7 @@ import type {
   RuntimeValidationResult,
 } from './types.js';
 import { assertTransitionAllowed, isTerminalStatus, requiresApprovalBeforeExecution } from './transitions.js';
+import { redactJsonValue, redactRecord, redactText } from './redaction.js';
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -69,12 +70,17 @@ function assertInStatus(task: RuntimeTask, expected: RuntimeStatus, action: stri
   }
 }
 
-/** Appends an event and bumps updatedAt on an already-cloned task. Mutates in place, returns it. */
+/**
+ * Appends an event and bumps updatedAt on an already-cloned task. Mutates in place, returns it.
+ * `message`/`data` are redacted here so every event type — current and future — is covered by
+ * a single choke point, rather than relying on every call site to redact its own strings.
+ */
 function pushEvent(task: RuntimeTask, type: RuntimeEventType, message: string, data?: JsonValue): RuntimeTask {
   const timestamp = nowIso();
+  const redactedMessage = redactText(message);
   const event = data === undefined
-    ? { type, taskId: task.id, timestamp, message }
-    : { type, taskId: task.id, timestamp, message, data };
+    ? { type, taskId: task.id, timestamp, message: redactedMessage }
+    : { type, taskId: task.id, timestamp, message: redactedMessage, data: redactJsonValue(data) };
   task.logs.push(event);
   task.updatedAt = timestamp;
   return task;
@@ -138,7 +144,7 @@ export function createTask(input: CreateTaskInput): RuntimeTask {
     riskLevel,
     executionPolicy,
     approvalRequired,
-    inputs: input.inputs ?? {},
+    inputs: redactRecord(input.inputs ?? {}),
     evidence: [],
     validationCommands: input.validationCommands ?? [],
     logs: [],
@@ -152,7 +158,7 @@ export function createTask(input: CreateTaskInput): RuntimeTask {
     type: 'TASK_CREATED',
     taskId: task.id,
     timestamp,
-    message: `Task created for ${input.product}: ${input.objective}`,
+    message: redactText(`Task created for ${input.product}: ${input.objective}`),
     data: { riskLevel, executionPolicy, approvalRequired },
   });
   return task;
@@ -266,10 +272,10 @@ function buildEvidence(input: RuntimeEvidenceInput): RuntimeEvidence {
     id: input.id ?? generateId('evidence'),
     type: input.type,
     label: input.label,
-    detail: input.detail,
+    detail: redactText(input.detail),
     // Omit (rather than set-to-undefined) so the object round-trips through
     // JSON without a key-count mismatch — see assertJsonSafe.
-    ...(input.source !== undefined ? { source: input.source } : {}),
+    ...(input.source !== undefined ? { source: redactText(input.source) } : {}),
     createdAt: nowIso(),
   };
 }
@@ -305,7 +311,7 @@ function buildValidationResult(input: RuntimeValidationInput): RuntimeValidation
   const checks = input.checks.map((check) => ({
     command: check.command,
     passed: check.passed,
-    ...(check.message !== undefined ? { message: check.message } : {}),
+    ...(check.message !== undefined ? { message: redactText(check.message) } : {}),
   }));
   const passed = checks.length > 0 && checks.every((check) => check.passed);
   const failedCount = checks.filter((check) => !check.passed).length;
@@ -361,7 +367,7 @@ function buildResult(input: RuntimeResultInput, success: boolean): RuntimeResult
   return {
     success,
     summary: input.summary,
-    ...(input.output !== undefined ? { output: input.output } : {}),
+    ...(input.output !== undefined ? { output: redactJsonValue(input.output) } : {}),
     completedAt: nowIso(),
   };
 }
@@ -413,7 +419,7 @@ export interface RuntimeRecommendationInput {
 function buildRecommendation(input: RuntimeRecommendationInput): RuntimeRecommendation {
   return {
     action: input.action,
-    reason: input.reason,
+    reason: redactText(input.reason),
     ...(input.confidence !== undefined ? { confidence: input.confidence } : {}),
     createdAt: nowIso(),
   };

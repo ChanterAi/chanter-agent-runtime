@@ -64,6 +64,29 @@ export {
 export type { RuntimeEvidenceBundle, RuntimeEventSummary, RuntimeReviewSummary, RuntimeReviewSummaryFields } from './evidence.js';
 export { createEvidenceBundle, summarizeTaskForReview, assertJsonSafe } from './evidence.js';
 
+// ── Redaction ──
+export { redactText, redactJsonValue, redactRecord } from './redaction.js';
+
+// ── Action policy evaluator ──
+export type { RuntimeActionType, RuntimeActionRequest, RuntimeActionDecision } from './policy.js';
+export { evaluateRuntimeActionPolicy } from './policy.js';
+
+// ── Provider routing foundation ──
+export type {
+  RuntimeProviderRoute,
+  RuntimeProviderRouteRequest,
+  RuntimeProviderRouteDecision,
+} from './providerRouting.js';
+export { selectProviderRoute } from './providerRouting.js';
+
+// ── Generic adapter contract ──
+export type {
+  RuntimeAdapterInputEnvelope,
+  RuntimeAdapterResult,
+  RuntimeProductAdapter,
+} from './adapters/runtimeAdapter.js';
+export { runProductAdapter } from './adapters/runtimeAdapter.js';
+
 // ── Product adapters ──
 export type {
   SafeCommitVerdict,
@@ -75,5 +98,6 @@ export {
   mapSafeCommitRiskLevel,
   mapAdvisoryContractToRuntimeTask,
   buildSafeCommitEvidenceBundle,
+  safeCommitAdapter,
   SAMPLE_ADVISORY_CONTRACT,
 } from './adapters/safeCommitAdapter.js';

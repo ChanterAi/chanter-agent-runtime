@@ -104,3 +104,159 @@ hand-assembling a bundle shape. Notably: a `RED` verdict (`riskLevel: HIGH`) for
 approval gate, so the resulting task honestly stops at `approval_required` — it does not
 fabricate an approval SafeCommit itself never granted. See the adapter's module doc
 comment for the full reasoning and the "no cross-repo import" rationale.
+
+As of the P1 hardening pass, `src/adapters/safeCommitAdapter.ts` also exports
+`safeCommitAdapter`, a `RuntimeProductAdapter<SafeCommitAdvisoryContractInput>` object
+wrapping the same free functions — see **§10 Adapter contract** below.
+
+## 8. Redaction guarantees
+
+`src/redaction.ts` provides `redactText`, `redactJsonValue`, and `redactRecord`. They are
+best-effort pattern redaction, not a cryptographic guarantee: a defensive net against
+secrets accidentally flowing into task data, not a substitute for keeping real secrets
+out of it in the first place.
+
+Patterns covered:
+- `KEY=value` / `KEY: value` style assignments where the identifier contains
+  `API_KEY`/`ACCESS_KEY`/`SECRET_KEY`/`PRIVATE_KEY`/`PASSWORD`/`SECRET`/`TOKEN`/`CREDENTIAL(S)`,
+  case-insensitively and with or without underscores (`OPENAI_API_KEY=`, `apiKey:`,
+  `DB_PASSWORD=`, …) — only the value is redacted.
+- `Bearer <token>` HTTP authorization headers.
+- OpenAI/Anthropic-style `sk-...` secret keys.
+- GitHub `ghp_...` and `github_pat_...` tokens.
+- PEM-style private key blocks (`-----BEGIN ... PRIVATE KEY----- … -----END ... PRIVATE KEY-----`).
+- A fallback net for long (32+ char), contiguous, mixed-case-plus-digit tokens (typical of
+  base64/JWT secrets) that don't match any named pattern above. Plain lowercase/digit-only
+  identifiers (git hashes, generated task ids) are deliberately left alone.
+- JSON object keys that look like credential fields
+  (`password`/`secret`/`token`/`*_key`/`credential`) are collapsed to `"[REDACTED]"`
+  wholesale, regardless of the value's shape — except `null`, which stays `null`.
+
+Redaction is applied in two layers:
+1. **At the write boundary**, inside `tasks.ts`, at the single points where each field is
+   constructed: `createTask` (`task.inputs`), the shared `pushEvent` helper (every
+   `RuntimeEvent.message`/`.data`, across all event types), `buildEvidence`
+   (`RuntimeEvidence.detail`/`.source`), `buildValidationResult`
+   (`RuntimeValidationCheck.message`), `buildResult` (`RuntimeResult.output`), and
+   `buildRecommendation` (`RuntimeRecommendation.reason`).
+2. **At the export boundary**, defensively, inside `evidence.ts`: `createEvidenceBundle`
+   and `summarizeTaskForReview` re-redact the same fields before returning, so the
+   exported shape is safe even if a `RuntimeTask` was hand-assembled rather than driven
+   through the lifecycle functions.
+
+Redaction never introduces `undefined`: every function stays within `JsonValue`, and
+`redactRecord`/`redactJsonValue` round-trip cleanly through `JSON.stringify`/`parse`.
+
+## 9. Action policy evaluator
+
+`src/policy.ts` exports `evaluateRuntimeActionPolicy(task, request)`, a second,
+additive gate alongside the status transition table: where `assertTransitionAllowed`
+governs which `RuntimeStatus` a task may move to, this evaluator governs whether a
+concrete side-effecting action may be performed *right now*. It never mutates a task
+and never performs the action — it only returns a `RuntimeActionDecision`.
+
+`RuntimeActionType` = `read | write | shell | network | commit | deploy | publish | delete`.
+
+Rules:
+- **Terminal tasks** cannot perform any action, `read` included — `blocked: true`.
+- **`read`** is allowed at every non-terminal status, regardless of risk or policy.
+- **`write` / `shell` / `network`** share a status gate: blocked while the task itself is
+  `blocked`; not yet allowed in `draft` (no plan attached); `approvalRequired: true` while
+  `approval_required` or while `planned` with an unresolved approval gate; allowed once
+  `planned` (no gate needed), `approved`, `executing`, or `validating`. This reuses
+  `task.approvalRequired`/`task.status` rather than re-deriving a risk check, since
+  high/critical risk is already baked into `approvalRequired` by transitions.ts.
+- **`commit`** requires `executionPolicy` of `commit_guarded` or `requires_safecommit_review`;
+  otherwise `blocked: true` with `requiredPolicy: 'commit_guarded'`. Once policy-eligible,
+  the same status gate as write/shell/network applies.
+- **`deploy`** requires `executionPolicy: 'deploy_guarded'`; otherwise blocked with
+  `requiredPolicy: 'deploy_guarded'`.
+- **`publish`** requires `executionPolicy: 'publish_guarded'`; otherwise blocked with
+  `requiredPolicy: 'publish_guarded'`.
+- **`delete`** is blocked by default (`blocked: true`) — the runtime has no delete
+  implementation yet. A `dryRun: true` request reports that honestly instead of
+  pretending a preview exists: `blocked: false`, `allowed: false`, with a reason
+  explaining explicit delete support must be added first.
+- **`dryRun: true`** on any action type forces `allowed: false` in the returned decision
+  (a dry run must never report as having actually been allowed to run), while still
+  reporting what `blocked`/`approvalRequired` would be for a real request.
+
+## 10. Provider routing foundation
+
+`src/providerRouting.ts` exports `selectProviderRoute(request, candidates)`. It makes
+**no model calls and no network calls** — it is pure candidate selection over a plain
+in-memory list the caller supplies (`RuntimeProviderRoute[]`), each entry carrying
+`provider`, `toolId`, `product`, `capability`, and `enabled`.
+
+Given a `RuntimeProviderRouteRequest` (`product`, `capability`, `reason`), it:
+- picks the **first enabled candidate** matching `product`+`capability`, in the order
+  `candidates` was given (callers encode priority via array order);
+- returns a `RuntimeProviderRouteDecision` with `provider`, `toolId`, a human-readable
+  `reason`, and `fallbackCandidates` — the other matching candidates not selected;
+- returns `blocked: true` with `provider`/`toolId: null` when nothing matches (wrong
+  product, wrong capability, or every matching candidate disabled), never throws;
+- stays fully JSON-safe.
+
+Wiring an actual provider/model call remains entirely the caller's responsibility.
+
+## 11. Generic adapter contract
+
+`src/adapters/runtimeAdapter.ts` defines the shape every product-specific adapter in
+this package should conform to, independent of any one product:
+
+- `RuntimeAdapterInputEnvelope<TInput>` — wraps a product-specific input payload with
+  optional `correlationId`/`receivedAt` metadata.
+- `RuntimeAdapterResult` — `{ task: RuntimeTask; evidenceBundle: RuntimeEvidenceBundle }`.
+- `RuntimeProductAdapter<TInput>` — `{ id, product, version, mapToRuntimeTask(input),
+  buildEvidenceBundle(input) }`.
+- `runProductAdapter(adapter, envelope)` — runs `mapToRuntimeTask` once, then derives the
+  bundle from that exact task via `createEvidenceBundle`, so the returned task and bundle
+  are guaranteed to describe one another. (Calling `adapter.mapToRuntimeTask` and
+  `adapter.buildEvidenceBundle` independently for the same input is *not* guaranteed to
+  produce matching ids, since each mapping generates its own task unless the input
+  carries an explicit, stable id — use `runProductAdapter` when that guarantee matters.)
+
+`safeCommitAdapter` (see §7) is the reference implementation of this contract.
+
+## 12. Integration rules for CHANTER products
+
+This package is a shared library, not a running service — nothing here is wired into any
+product's live control flow yet. Each product integrates by depending on this package and
+driving its own inputs through the contract:
+
+- **SafeCommit**: use `safeCommitAdapter` (or the underlying
+  `mapAdvisoryContractToRuntimeTask`/`buildSafeCommitEvidenceBundle` functions) to turn an
+  `ADVISORY_CONTRACT.json` payload into a `RuntimeTask`. Never let this package's approval
+  gate be treated as SafeCommit's own commit gate — SafeCommit's `commitApproval` stays
+  `NOT_GRANTED` regardless of what this runtime reports.
+- **Operator**: model each orchestrated step as a `RuntimeTask` with the execution policy
+  matching its real-world guard (`deploy_guarded` for deploys, `commit_guarded` for
+  commits, etc.) so `evaluateRuntimeActionPolicy` reflects the actual gate, not a default.
+- **Loop Governor**: attach one `RuntimeTask` per governed iteration; use `blockTask`/
+  `attachPlan` recovery for stalled loops rather than fabricating a synthetic completion.
+- **AutoPoster**: any outbound post is a `publish` action — route it through
+  `evaluateRuntimeActionPolicy` with `executionPolicy: 'publish_guarded'` and attach the
+  `publish` guard tag on the clearance evidence before treating a post as approved.
+- **MCP Server**: expose `createEvidenceBundle`/`summarizeTaskForReview` output to callers,
+  never raw `RuntimeTask` internals — the bundle is the redacted, JSON-safe, stable export
+  shape this contract guarantees.
+- **Memory Vault**: treat anything persisted through this runtime as already
+  redaction-passed at the write boundary (§8), but do not assume redaction is perfect —
+  Memory Vault's own storage layer should not be the only place secrets are ever checked.
+
+No product's adapter should import another product's source directly (see the
+"no cross-repo import" rationale in `safeCommitAdapter.ts`); depend on this package's
+public exports (`src/index.ts`) only.
+
+## 13. Validation commands
+
+From `apps/chanter-agent-runtime`:
+
+```
+npm run build       # tsc — compiles src/ and tests/ to dist/
+npm run typecheck   # tsc --noEmit — type-checks without emitting
+npm test            # node --test dist/tests/**/*.test.js — runs the compiled suite
+```
+
+`npm test` runs compiled output, so `npm run build` (or `npm run typecheck` for a
+type-only pass) must be run first after any source change.
