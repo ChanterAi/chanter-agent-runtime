@@ -34,6 +34,10 @@ npm test
 
 ## Status
 
-Real, tested foundation (72 tests). Not yet wired into any product's live control flow.
+Real, tested foundation (132 tests passing, verified 2026-07-09). Consumed by
+chanter-Operator's backend: `apps/backend/package.json` declares a `file:` dependency and
+Operator's runtime bridge imports this package's contract, policy, redaction, and
+provider-routing modules (see [docs/RUNTIME_CONTRACT.md](docs/RUNTIME_CONTRACT.md)).
+Not yet driving any live external control flow.
 One adapter exists today: `src/adapters/safeCommitAdapter.ts` (SafeCommit
 `AdvisoryContract` -> `RuntimeTask`).
