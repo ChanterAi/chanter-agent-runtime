@@ -1,10 +1,12 @@
 # CHANTER Agent Runtime — Contract
 
-> Status: real, tested foundation. Consumed by chanter-Operator's backend since 2026-07-07:
+> Status: real, tested runtime. Consumed by chanter-Operator's backend since 2026-07-07:
 > `apps/backend/package.json` declares a `file:` dependency on this package, and Operator's
 > runtime bridge (`apps/backend/src/agentRuntime/runtimeBridge/`) imports its contract,
-> policy, redaction, and provider-routing modules. Not yet driving any live external
-> control flow.
+> policy, redaction, and provider-routing modules. Since P1B (2026-07-10) the runtime also
+> drives one live product control flow — the AutoPoster operational control loop
+> (`src/missions.ts` + `src/adapters/autoPosterMissionAdapter.ts`), consumed by
+> chanter-mcp-server. See docs/AUTOPOSTER_CONTROL_LOOP.md.
 
 ## 1. Purpose
 

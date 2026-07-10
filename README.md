@@ -34,10 +34,15 @@ npm test
 
 ## Status
 
-Real, tested foundation (132 tests passing, verified 2026-07-09). Consumed by
+Real, tested runtime (187 tests passing, verified 2026-07-10). Consumed by
 chanter-Operator's backend: `apps/backend/package.json` declares a `file:` dependency and
 Operator's runtime bridge imports this package's contract, policy, redaction, and
 provider-routing modules (see [docs/RUNTIME_CONTRACT.md](docs/RUNTIME_CONTRACT.md)).
-Not yet driving any live external control flow.
-One adapter exists today: `src/adapters/safeCommitAdapter.ts` (SafeCommit
-`AdvisoryContract` -> `RuntimeTask`).
+Since P1B (2026-07-10) the runtime also drives one live product control flow: the
+AutoPoster operational control loop (mission executor in `src/missions.ts`, AutoPoster
+mission adapter + HTTP operations port in `src/adapters/`), consumed by
+chanter-mcp-server via a `file:` dependency — see
+[docs/AUTOPOSTER_CONTROL_LOOP.md](docs/AUTOPOSTER_CONTROL_LOOP.md).
+Adapters today: `src/adapters/safeCommitAdapter.ts` (SafeCommit `AdvisoryContract` ->
+`RuntimeTask`, mapping-only) and `src/adapters/autoPosterMissionAdapter.ts` (executing
+mission adapter behind an injected operations port).

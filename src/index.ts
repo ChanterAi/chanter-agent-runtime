@@ -87,6 +87,56 @@ export type {
 } from './adapters/runtimeAdapter.js';
 export { runProductAdapter } from './adapters/runtimeAdapter.js';
 
+// ── Mission execution layer (P1B) ──
+export type {
+  RuntimeMissionActor,
+  RuntimeMissionTenant,
+  RuntimeMissionApproval,
+  RuntimeMissionRequest,
+  RuntimeMissionStatus,
+  RuntimeMissionError,
+  RuntimeMissionApprovalDecision,
+  RuntimeMissionIdempotencyOutcome,
+  RuntimeMissionIdempotencyResult,
+  RuntimeMissionResult,
+  RuntimeMissionActionSpec,
+  RuntimeMissionAdapterOutcome,
+  RuntimeMissionAdapter,
+  RuntimeMissionAdapterRegistry,
+  RuntimeMissionIdempotencyStore,
+  ExecuteMissionOptions,
+} from './missions.js';
+export {
+  createMissionAdapterRegistry,
+  createInMemoryIdempotencyStore,
+  executeMission,
+} from './missions.js';
+
+// ── AutoPoster mission adapter + operations port ──
+export type {
+  AutoPosterPortErrorCode,
+  AutoPosterPortFailure,
+  AutoPosterQueueItemView,
+  AutoPosterQueueListSuccess,
+  AutoPosterPostStatusView,
+  AutoPosterPostStatusSuccess,
+  AutoPosterMediaValidationSuccess,
+  AutoPosterScheduleSuccess,
+  AutoPosterQueueListParams,
+  AutoPosterPostStatusParams,
+  AutoPosterMediaValidationParams,
+  AutoPosterScheduleParams,
+  AutoPosterOperationsPort,
+} from './adapters/autoPosterMissionAdapter.js';
+export {
+  AUTOPOSTER_ACTIONS,
+  AUTOPOSTER_MISSION_ADAPTER_ID,
+  createAutoPosterMissionAdapter,
+  normalizeScheduledAt,
+} from './adapters/autoPosterMissionAdapter.js';
+export type { AutoPosterHttpPortOptions } from './adapters/autoPosterHttpPort.js';
+export { createAutoPosterHttpPort, RUNTIME_CONTROL_TOKEN_HEADER } from './adapters/autoPosterHttpPort.js';
+
 // ── Product adapters ──
 export type {
   SafeCommitVerdict,
