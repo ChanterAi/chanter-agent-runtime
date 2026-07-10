@@ -295,6 +295,54 @@ describe('autoposter.post.schedule', () => {
     assert.equal(output.publishing, 'blocked_until_human_approval');
   });
 
+  it('a YouTube mission passes provider, title, and description through to the port', async () => {
+    const scheduledAt = futureIso();
+    const { result, calls } = await run(
+      {},
+      approvedSchedule({
+        provider: 'youtube',
+        accountId: 'UC-chanter',
+        mediaUrl: 'https://cdn.example.com/a.mp4',
+        scheduledAt,
+        title: 'Private launch teaser',
+        description: 'Supervised test upload',
+      })
+    );
+    assert.equal(result.status, 'succeeded');
+    assert.equal(calls.schedulePost.length, 1);
+    const params = calls.schedulePost[0] as { provider?: string; title?: string; description?: string };
+    assert.equal(params.provider, 'youtube');
+    assert.equal(params.title, 'Private launch teaser');
+    assert.equal(params.description, 'Supervised test upload');
+  });
+
+  it('a YouTube mission without a title fails before the port is called', async () => {
+    const { result, calls } = await run(
+      {},
+      approvedSchedule({
+        provider: 'youtube',
+        accountId: 'UC-chanter',
+        mediaUrl: 'https://cdn.example.com/a.mp4',
+        scheduledAt: futureIso(),
+      })
+    );
+    assert.equal(result.status, 'validation_failed');
+    assert.equal(result.errors[0]!.code, 'MISSING_YOUTUBE_TITLE');
+    assert.equal(calls.schedulePost.length, 0);
+  });
+
+  it('a TikTok mission (no provider) sends no provider or YouTube fields downstream', async () => {
+    const { result, calls } = await run(
+      {},
+      approvedSchedule({ accountId: 'account-a', mediaUrl: 'https://cdn.example.com/a.mp4', scheduledAt: futureIso() })
+    );
+    assert.equal(result.status, 'succeeded');
+    const params = calls.schedulePost[0] as Record<string, unknown>;
+    assert.equal('provider' in params, false);
+    assert.equal('title' in params, false);
+    assert.equal('description' in params, false);
+  });
+
   it('missing approval never reaches the port', async () => {
     const { result, calls } = await run(
       {},

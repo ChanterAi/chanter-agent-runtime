@@ -198,5 +198,37 @@ describe('createAutoPosterHttpPort — reachability and boundedness', () => {
     assert.equal(body.accountId, 'account-a');
     assert.equal(body.idempotencyKey, 'idem-9');
     assert.equal(body.userId, undefined, 'tenant identity must be derived server-side from the token');
+    assert.equal('provider' in body, false, 'a TikTok schedule carries no provider field (backward compatibility)');
+    assert.equal('title' in body, false);
+  });
+
+  it('a YouTube schedule carries provider, title, and description in the body', async () => {
+    const { fetchImpl, calls } = makeFetch(() => ({
+      status: 201,
+      json: {
+        ok: true,
+        duplicate: false,
+        post: { id: 'post-10', accountId: 'UC-chanter', status: 'scheduled', scheduledAt: '2099-07-11T09:00:00.000Z', approved: false },
+      },
+    }));
+    const port = makePort(fetchImpl);
+    const result = await port.schedulePost({
+      userId: 'owner',
+      accountId: 'UC-chanter',
+      provider: 'youtube',
+      mediaUrl: 'https://cdn.example.com/a.mp4',
+      caption: '',
+      hashtags: '',
+      title: 'Private launch teaser',
+      description: 'Supervised test upload',
+      scheduledAt: '2099-07-11T09:00:00.000Z',
+      idempotencyKey: 'idem-10',
+      requestedBy: 'mcp-client',
+    });
+    assert.equal(result.ok, true);
+    const body = JSON.parse(calls[0]!.body!) as Record<string, unknown>;
+    assert.equal(body.provider, 'youtube');
+    assert.equal(body.title, 'Private launch teaser');
+    assert.equal(body.description, 'Supervised test upload');
   });
 });

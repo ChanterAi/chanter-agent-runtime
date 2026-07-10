@@ -121,9 +121,19 @@ export interface AutoPosterMediaValidationParams {
 export interface AutoPosterScheduleParams {
   userId: string;
   accountId: string;
+  /**
+   * Optional publishing provider ('tiktok' | 'youtube'). Omitted means
+   * TikTok (full backward compatibility). AutoPoster's application service
+   * stays the authority on provider validity, account readiness, and
+   * provider metadata rules.
+   */
+  provider?: string;
   mediaUrl: string;
   caption: string;
   hashtags: string;
+  /** YouTube-only metadata: required title and optional description. */
+  title?: string;
+  description?: string;
   scheduledAt: string;
   idempotencyKey: string;
   requestedBy: string;
@@ -386,9 +396,18 @@ export function createAutoPosterMissionAdapter(port: AutoPosterOperationsPort): 
     const scheduledAtRaw = asTrimmedString(request.input.scheduledAt);
     const caption = asTrimmedString(request.input.caption);
     const hashtags = asTrimmedString(request.input.hashtags);
+    // Optional provider selection (Part 3: YouTube). AutoPoster remains the
+    // authority; this only rejects the one KNOWN-missing field early so a
+    // mission gets a precise error instead of a downstream refusal.
+    const provider = asTrimmedString(request.input.provider).toLowerCase();
+    const title = asTrimmedString(request.input.title);
+    const description = asTrimmedString(request.input.description);
 
     if (!accountId) errors.push({ code: 'MISSING_ACCOUNT_ID', message: 'accountId is required for scheduling.' });
     if (!mediaUrl) errors.push({ code: 'MISSING_MEDIA_URL', message: 'mediaUrl is required for scheduling.' });
+    if (provider === 'youtube' && !title) {
+      errors.push({ code: 'MISSING_YOUTUBE_TITLE', message: 'title is required when provider is youtube.' });
+    }
     if (!scheduledAtRaw) {
       errors.push({ code: 'MISSING_SCHEDULED_AT', message: 'scheduledAt is required for scheduling.' });
     }
@@ -406,9 +425,12 @@ export function createAutoPosterMissionAdapter(port: AutoPosterOperationsPort): 
     const result = await port.schedulePost({
       userId: request.tenant.userId,
       accountId,
+      ...(provider ? { provider } : {}),
       mediaUrl,
       caption,
       hashtags,
+      ...(title ? { title } : {}),
+      ...(description ? { description } : {}),
       scheduledAt: scheduledAtIso,
       // executeMission guarantees this is present for requiresIdempotencyKey actions.
       idempotencyKey: request.idempotencyKey!.trim(),

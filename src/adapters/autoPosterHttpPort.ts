@@ -144,9 +144,12 @@ export function createAutoPosterHttpPort(options: AutoPosterHttpPortOptions): Au
     schedulePost(params: AutoPosterScheduleParams) {
       return call<AutoPosterScheduleSuccess>('POST', '/api/runtime/schedule', {
         accountId: params.accountId,
+        ...(params.provider ? { provider: params.provider } : {}),
         mediaUrl: params.mediaUrl,
         caption: params.caption,
         hashtags: params.hashtags,
+        ...(params.title ? { title: params.title } : {}),
+        ...(params.description ? { description: params.description } : {}),
         scheduledAt: params.scheduledAt,
         idempotencyKey: params.idempotencyKey,
         requestedBy: params.requestedBy,
