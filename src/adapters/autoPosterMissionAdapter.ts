@@ -38,10 +38,26 @@ export type AutoPosterPortErrorCode =
   | 'unavailable'
   | 'internal';
 
+/**
+ * Safe commercial-decision facts returned by AutoPoster. These are
+ * server-authoritative response fields, never caller-supplied plan claims.
+ */
+export interface AutoPosterCommercialDenialDetails {
+  reasonCode?: string;
+  current?: number | null;
+  limit?: number | null;
+  remaining?: number | null;
+  planId?: string;
+  workspaceId?: string;
+  evaluationTimestamp?: string;
+}
+
 export interface AutoPosterPortFailure {
   ok: false;
   code: AutoPosterPortErrorCode;
   message: string;
+  /** Allowlisted entitlement/usage facts, when AutoPoster supplied them. */
+  details?: AutoPosterCommercialDenialDetails;
 }
 
 /** Safe, normalized queue item view — never tokens, credentials, or raw provider payloads. */
@@ -102,12 +118,14 @@ export interface AutoPosterScheduleSuccess {
 
 export interface AutoPosterQueueListParams {
   userId: string;
+  workspaceId?: string;
   accountId?: string;
   limit: number;
 }
 
 export interface AutoPosterPostStatusParams {
   userId: string;
+  workspaceId?: string;
   postId: string;
   accountId?: string;
 }
@@ -120,6 +138,7 @@ export interface AutoPosterMediaValidationParams {
 
 export interface AutoPosterScheduleParams {
   userId: string;
+  workspaceId?: string;
   accountId: string;
   /**
    * Optional publishing provider ('tiktok' | 'youtube'). Omitted means
@@ -227,6 +246,7 @@ function portFailureOutcome(action: string, failure: AutoPosterPortFailure): Run
   return {
     ok: false,
     status,
+    ...(failure.details ? { output: { ...failure.details } as JsonValue } : {}),
     errors: [{ code: `AUTOPOSTER_${failure.code.toUpperCase()}`, message: failure.message }],
     evidence: [
       {
@@ -282,6 +302,7 @@ export const AUTOPOSTER_MISSION_ADAPTER_ID = 'autoposter-mission-adapter';
 export function createAutoPosterMissionAdapter(port: AutoPosterOperationsPort): RuntimeMissionAdapter {
   async function executeQueueList(request: RuntimeMissionRequest): Promise<RuntimeMissionAdapterOutcome> {
     const accountId = asTrimmedString(request.input.accountId) || request.tenant.accountId?.trim() || '';
+    const workspaceId = request.tenant.workspaceId?.trim() || '';
     const rawLimit = request.input.limit;
     let limit = QUEUE_LIST_DEFAULT_LIMIT;
     if (rawLimit !== undefined) {
@@ -295,6 +316,7 @@ export function createAutoPosterMissionAdapter(port: AutoPosterOperationsPort): 
 
     const result = await port.listQueue({
       userId: request.tenant.userId,
+      ...(workspaceId ? { workspaceId } : {}),
       ...(accountId ? { accountId } : {}),
       limit,
     });
@@ -324,9 +346,11 @@ export function createAutoPosterMissionAdapter(port: AutoPosterOperationsPort): 
       return validationFailure([{ code: 'MISSING_POST_ID', message: 'postId is required.' }]);
     }
     const accountId = asTrimmedString(request.input.accountId) || request.tenant.accountId?.trim() || '';
+    const workspaceId = request.tenant.workspaceId?.trim() || '';
 
     const result = await port.getPostStatus({
       userId: request.tenant.userId,
+      ...(workspaceId ? { workspaceId } : {}),
       postId,
       ...(accountId ? { accountId } : {}),
     });
@@ -392,6 +416,7 @@ export function createAutoPosterMissionAdapter(port: AutoPosterOperationsPort): 
   async function executePostSchedule(request: RuntimeMissionRequest): Promise<RuntimeMissionAdapterOutcome> {
     const errors: RuntimeMissionError[] = [];
     const accountId = asTrimmedString(request.input.accountId) || request.tenant.accountId?.trim() || '';
+    const workspaceId = request.tenant.workspaceId?.trim() || '';
     const mediaUrl = asTrimmedString(request.input.mediaUrl);
     const scheduledAtRaw = asTrimmedString(request.input.scheduledAt);
     const caption = asTrimmedString(request.input.caption);
@@ -424,6 +449,7 @@ export function createAutoPosterMissionAdapter(port: AutoPosterOperationsPort): 
 
     const result = await port.schedulePost({
       userId: request.tenant.userId,
+      ...(workspaceId ? { workspaceId } : {}),
       accountId,
       ...(provider ? { provider } : {}),
       mediaUrl,

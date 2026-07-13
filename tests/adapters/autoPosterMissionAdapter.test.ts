@@ -146,6 +146,23 @@ describe('autoposter.queue.list', () => {
     assert.equal(output.scope.accountId, 'account-a');
   });
 
+  it('passes the optional tenant workspace scope to the port', async () => {
+    const { result, calls } = await run(
+      {},
+      {
+        tenant: { userId: 'owner', workspaceId: 'workspace-a' },
+        input: { accountId: 'account-a', limit: 10 },
+      }
+    );
+    assert.equal(result.status, 'succeeded');
+    assert.deepEqual(calls.listQueue[0], {
+      userId: 'owner',
+      workspaceId: 'workspace-a',
+      accountId: 'account-a',
+      limit: 10,
+    });
+  });
+
   it('returns a truthful empty result distinct from failure', async () => {
     const { result } = await run(
       {
@@ -226,6 +243,24 @@ describe('autoposter.post.get_status', () => {
     );
     assert.equal(result.status, 'succeeded');
     assert.deepEqual(calls.getPostStatus[0], { userId: 'owner', postId: 'post-1', accountId: 'account-a' });
+  });
+
+  it('passes workspace and account scopes together', async () => {
+    const { result, calls } = await run(
+      {},
+      {
+        action: AUTOPOSTER_ACTIONS.postGetStatus,
+        tenant: { userId: 'owner', workspaceId: 'workspace-a', accountId: 'account-a' },
+        input: { postId: 'post-1' },
+      }
+    );
+    assert.equal(result.status, 'succeeded');
+    assert.deepEqual(calls.getPostStatus[0], {
+      userId: 'owner',
+      workspaceId: 'workspace-a',
+      postId: 'post-1',
+      accountId: 'account-a',
+    });
   });
 });
 
@@ -341,6 +376,29 @@ describe('autoposter.post.schedule', () => {
     assert.equal('provider' in params, false);
     assert.equal('title' in params, false);
     assert.equal('description' in params, false);
+    assert.equal('workspaceId' in params, false, 'legacy missions remain workspace-optional');
+  });
+
+  it('uses only the tenant workspace and ignores caller-supplied plan/workspace claims', async () => {
+    const { result, calls } = await run(
+      {},
+      approvedSchedule(
+        {
+          accountId: 'account-a',
+          mediaUrl: 'https://cdn.example.com/a.mp4',
+          scheduledAt: futureIso(),
+          workspaceId: 'untrusted-input-workspace',
+          planId: 'studio',
+          remaining: 999999,
+        },
+        { tenant: { userId: 'owner', workspaceId: 'workspace-a' } }
+      )
+    );
+    assert.equal(result.status, 'succeeded');
+    const params = calls.schedulePost[0] as Record<string, unknown>;
+    assert.equal(params.workspaceId, 'workspace-a');
+    assert.equal('planId' in params, false);
+    assert.equal('remaining' in params, false);
   });
 
   it('missing approval never reaches the port', async () => {
@@ -414,6 +472,36 @@ describe('autoposter.post.schedule', () => {
       approvedSchedule({ accountId: 'account-x', mediaUrl: 'https://cdn.example.com/a.mp4', scheduledAt: futureIso() })
     );
     assert.equal(result.status, 'denied');
+    assert.equal(result.errors[0]!.code, 'AUTOPOSTER_FORBIDDEN');
+  });
+
+  it('preserves allowlisted server-side commercial denial facts in mission output', async () => {
+    const details = {
+      reasonCode: 'runtime_scheduling_not_allowed',
+      current: 0,
+      limit: 0,
+      remaining: 0,
+      planId: 'starter',
+      workspaceId: 'workspace-a',
+    };
+    const { result } = await run(
+      {
+        async schedulePost() {
+          return {
+            ok: false,
+            code: 'forbidden',
+            message: 'Runtime scheduling is not included in this plan.',
+            details,
+          } as AutoPosterPortFailure;
+        },
+      },
+      approvedSchedule(
+        { accountId: 'account-a', mediaUrl: 'https://cdn.example.com/a.mp4', scheduledAt: futureIso() },
+        { tenant: { userId: 'owner', workspaceId: 'workspace-a' } }
+      )
+    );
+    assert.equal(result.status, 'denied');
+    assert.deepEqual(result.output, details);
     assert.equal(result.errors[0]!.code, 'AUTOPOSTER_FORBIDDEN');
   });
 

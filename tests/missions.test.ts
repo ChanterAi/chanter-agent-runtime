@@ -228,6 +228,45 @@ describe('executeMission — idempotency', () => {
     assert.deepEqual(second.output, first.output);
   });
 
+  it('isolates the same caller key across workspaces while replaying within the original workspace', async () => {
+    const calls: RuntimeMissionRequest[] = [];
+    const { adapter } = makeAdapter({
+      async execute(request) {
+        calls.push(request);
+        return { ok: true, output: { workspaceId: request.tenant.workspaceId ?? null } };
+      },
+    });
+    const registry = createMissionAdapterRegistry([adapter]);
+    const store = createInMemoryIdempotencyStore();
+    const write = {
+      action: 'test.write',
+      idempotencyKey: 'same-caller-key',
+      approval: { approved: true, approvedBy: 'founder' },
+    };
+
+    const workspaceA = await executeMission(
+      makeRequest({ ...write, missionId: 'mission-a', tenant: { userId: 'owner', workspaceId: 'workspace-a' } }),
+      { registry, idempotencyStore: store }
+    );
+    const workspaceB = await executeMission(
+      makeRequest({ ...write, missionId: 'mission-b', tenant: { userId: 'owner', workspaceId: 'workspace-b' } }),
+      { registry, idempotencyStore: store }
+    );
+    const replayA = await executeMission(
+      makeRequest({ ...write, missionId: 'mission-a-replay', tenant: { userId: 'owner', workspaceId: 'workspace-a' } }),
+      { registry, idempotencyStore: store }
+    );
+
+    assert.equal(workspaceA.status, 'succeeded');
+    assert.equal(workspaceB.status, 'succeeded');
+    assert.deepEqual(workspaceB.output, { workspaceId: 'workspace-b' });
+    assert.equal(replayA.status, 'duplicate');
+    assert.equal(replayA.idempotency.key, 'same-caller-key', 'public result retains the caller key');
+    assert.equal(replayA.idempotency.originalMissionId, 'mission-a');
+    assert.deepEqual(replayA.output, { workspaceId: 'workspace-a' });
+    assert.equal(calls.length, 2, 'workspace B executes once; only the replay in workspace A is deduplicated');
+  });
+
   it('an approval-refused mission does not consume its idempotency key', async () => {
     const { adapter, calls } = makeAdapter();
     const registry = createMissionAdapterRegistry([adapter]);
@@ -250,6 +289,44 @@ describe('executeMission — idempotency', () => {
     assert.equal(refused.status, 'approval_required');
     assert.equal(retried.status, 'succeeded');
     assert.equal(calls.length, 1);
+  });
+
+  it('a denied execution does not consume its idempotency key', async () => {
+    let attempts = 0;
+    const { adapter } = makeAdapter({
+      async execute() {
+        attempts += 1;
+        if (attempts === 1) {
+          return {
+            ok: false,
+            status: 'denied',
+            errors: [{ code: 'AUTOPOSTER_FORBIDDEN', message: 'Quota denied.' }],
+          };
+        }
+        return { ok: true, output: { accepted: true } };
+      },
+    });
+    const registry = createMissionAdapterRegistry([adapter]);
+    const store = createInMemoryIdempotencyStore();
+    const request = {
+      action: 'test.write',
+      idempotencyKey: 'denial-retry-key',
+      approval: { approved: true, approvedBy: 'founder' },
+    };
+
+    const denied = await executeMission(makeRequest({ ...request, missionId: 'mission-denied' }), {
+      registry,
+      idempotencyStore: store,
+    });
+    const retried = await executeMission(makeRequest({ ...request, missionId: 'mission-retried' }), {
+      registry,
+      idempotencyStore: store,
+    });
+
+    assert.equal(denied.status, 'denied');
+    assert.equal(retried.status, 'succeeded');
+    assert.equal(retried.idempotency.outcome, 'first_execution');
+    assert.equal(attempts, 2);
   });
 });
 

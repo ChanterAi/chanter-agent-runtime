@@ -54,6 +54,8 @@ export interface RuntimeMissionActor {
 export interface RuntimeMissionTenant {
   /** Owning user/tenant identifier. Downstream products re-verify this server-side. */
   userId: string;
+  /** Optional workspace scope. Downstream products re-verify membership server-side. */
+  workspaceId?: string;
   /** Optional product account/channel scope (e.g. a TikTok channel id). */
   accountId?: string;
 }
@@ -211,15 +213,26 @@ export function createMissionAdapterRegistry(adapters: RuntimeMissionAdapter[]):
 // ---------------------------------------------------------------------------
 
 /**
- * Records the result of every mission that actually reached an adapter, keyed
- * by idempotency key. A later mission with the same key returns the stored
- * result as a 'duplicate' instead of executing twice. Missions that never
- * executed (validation/approval/policy refusals) do not consume their key,
- * so a corrected retry with the same key still works.
+ * Records the result of every mission that actually reached an adapter. The
+ * runtime supplies an opaque key scoped to product + tenant user + workspace
+ * + caller idempotency key, preventing one tenant scope from replaying another
+ * scope's result. Missions that never executed (validation/approval/policy
+ * refusals) do not consume their key, so a corrected retry with the same
+ * caller key still works.
  */
 export interface RuntimeMissionIdempotencyStore {
   get(key: string): RuntimeMissionResult | undefined;
   set(key: string, result: RuntimeMissionResult): void;
+}
+
+function scopedIdempotencyStoreKey(request: RuntimeMissionRequest, callerKey: string): string {
+  return JSON.stringify([
+    'runtime-mission-idempotency-v2',
+    request.product,
+    request.tenant.userId.trim(),
+    request.tenant.workspaceId?.trim() || null,
+    callerKey,
+  ]);
 }
 
 /** Simple per-process Map-backed store. Durable stores can implement the same interface. */
@@ -380,8 +393,9 @@ export async function executeMission(
   // 4. Idempotency replay — a key that already executed returns the stored
   //    result as an explicit duplicate instead of executing twice.
   const store = options.idempotencyStore;
-  if (idempotencyKey && store) {
-    const existing = store.get(idempotencyKey);
+  const storeKey = idempotencyKey ? scopedIdempotencyStoreKey(request, idempotencyKey) : null;
+  if (storeKey && store) {
+    const existing = store.get(storeKey);
     if (existing) {
       return finish({
         status: 'duplicate',
@@ -411,6 +425,7 @@ export async function executeMission(
       actorId: request.actor.id,
       actorKind: request.actor.kind ?? 'agent',
       tenantUserId: request.tenant.userId,
+      tenantWorkspaceId: request.tenant.workspaceId ?? null,
       tenantAccountId: request.tenant.accountId ?? null,
       input: request.input,
       metadata: request.metadata ?? {},
@@ -541,9 +556,11 @@ export async function executeMission(
       : { key: null, outcome: 'not_applicable' },
   });
 
-  // 10. Record executed missions so a replayed key cannot execute twice.
-  if (idempotencyKey && store) {
-    store.set(idempotencyKey, result);
+  // 10. Only successful/duplicate downstream outcomes consume the Runtime
+  // idempotency key. A refusal or unavailable dependency has no accepted side
+  // effect to replay, and must remain retryable under corrected server truth.
+  if (storeKey && store && outcome.ok) {
+    store.set(storeKey, result);
   }
   return result;
 }

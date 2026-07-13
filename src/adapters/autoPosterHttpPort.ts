@@ -19,6 +19,7 @@ import type {
   AutoPosterMediaValidationParams,
   AutoPosterMediaValidationSuccess,
   AutoPosterOperationsPort,
+  AutoPosterCommercialDenialDetails,
   AutoPosterPortErrorCode,
   AutoPosterPortFailure,
   AutoPosterPostStatusParams,
@@ -44,8 +45,72 @@ export const RUNTIME_CONTROL_TOKEN_HEADER = 'x-chanter-runtime-token';
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 
-function failure(code: AutoPosterPortErrorCode, message: string): AutoPosterPortFailure {
-  return { ok: false, code, message };
+// AutoPoster uses 409 for server-authoritative commercial refusals as well as
+// ordinary request conflicts. Only these canonical domain decisions are
+// promoted to `forbidden`; unrelated 409/404 responses retain their normal
+// validation/not-found classification.
+const COMMERCIAL_DENIAL_REASON_CODES = new Set([
+  'workspace_not_found',
+  'workspace_inactive',
+  'subscription_inactive',
+  'plan_not_found',
+  'entitlement_configuration_invalid',
+  'commercial_truth_unverified',
+  'feature_not_available',
+  'workspace_limit_reached',
+  'provider_limit_reached',
+  'connected_account_limit_reached',
+  'monthly_post_limit_reached',
+  'active_queue_limit_reached',
+  'batch_size_limit_exceeded',
+  'scheduling_horizon_exceeded',
+  'runtime_scheduling_not_allowed',
+]);
+
+function failure(
+  code: AutoPosterPortErrorCode,
+  message: string,
+  details?: AutoPosterCommercialDenialDetails
+): AutoPosterPortFailure {
+  return { ok: false, code, message, ...(details ? { details } : {}) };
+}
+
+function commercialDenialDetails(record: Record<string, unknown>): AutoPosterCommercialDenialDetails | undefined {
+  const details: AutoPosterCommercialDenialDetails = {};
+  const reasonCode =
+    typeof record.reasonCode === 'string' && record.reasonCode.trim()
+      ? record.reasonCode.trim()
+      : typeof record.code === 'string' && record.code.trim() && !isPortErrorCode(record.code)
+        ? record.code.trim()
+        : '';
+  if (reasonCode) details.reasonCode = reasonCode;
+
+  for (const field of ['current', 'limit', 'remaining'] as const) {
+    const value = record[field];
+    if (value === null || (typeof value === 'number' && Number.isFinite(value))) {
+      details[field] = value;
+    }
+  }
+  for (const field of ['planId', 'workspaceId'] as const) {
+    const value = record[field];
+    if (typeof value === 'string' && value.trim()) details[field] = value.trim();
+  }
+  if (
+    typeof record.evaluationTimestamp === 'string'
+    && Number.isFinite(Date.parse(record.evaluationTimestamp))
+  ) {
+    details.evaluationTimestamp = new Date(record.evaluationTimestamp).toISOString();
+  }
+  return Object.keys(details).length > 0 ? details : undefined;
+}
+
+function isCommercialDenial(
+  status: number,
+  details: AutoPosterCommercialDenialDetails | undefined
+): boolean {
+  return (status === 403 || status === 404 || status === 409)
+    && typeof details?.reasonCode === 'string'
+    && COMMERCIAL_DENIAL_REASON_CODES.has(details.reasonCode);
 }
 
 function statusToErrorCode(status: number): AutoPosterPortErrorCode {
@@ -113,11 +178,13 @@ export function createAutoPosterHttpPort(options: AutoPosterHttpPortOptions): Au
           : typeof record?.message === 'string'
             ? record.message
             : `HTTP ${response.status}`;
-      const code =
-        typeof record?.code === 'string' && isPortErrorCode(record.code)
+      const details = commercialDenialDetails(record);
+      const code = isCommercialDenial(response.status, details)
+        ? 'forbidden'
+        : typeof record?.code === 'string' && isPortErrorCode(record.code)
           ? record.code
           : statusToErrorCode(response.status);
-      return failure(code, `AutoPoster refused ${method} ${path}: ${reason}`);
+      return failure(code, `AutoPoster refused ${method} ${path}: ${reason}`, details);
     }
     return record as unknown as TSuccess;
   }
@@ -126,12 +193,14 @@ export function createAutoPosterHttpPort(options: AutoPosterHttpPortOptions): Au
     listQueue(params: AutoPosterQueueListParams) {
       const query = new URLSearchParams();
       if (params.accountId) query.set('accountId', params.accountId);
+      if (params.workspaceId) query.set('workspaceId', params.workspaceId);
       query.set('limit', String(params.limit));
       return call<AutoPosterQueueListSuccess>('GET', `/api/runtime/queue?${query.toString()}`);
     },
     getPostStatus(params: AutoPosterPostStatusParams) {
       const query = new URLSearchParams();
       if (params.accountId) query.set('accountId', params.accountId);
+      if (params.workspaceId) query.set('workspaceId', params.workspaceId);
       const suffix = query.size > 0 ? `?${query.toString()}` : '';
       return call<AutoPosterPostStatusSuccess>(
         'GET',
@@ -144,6 +213,7 @@ export function createAutoPosterHttpPort(options: AutoPosterHttpPortOptions): Au
     schedulePost(params: AutoPosterScheduleParams) {
       return call<AutoPosterScheduleSuccess>('POST', '/api/runtime/schedule', {
         accountId: params.accountId,
+        ...(params.workspaceId ? { workspaceId: params.workspaceId } : {}),
         ...(params.provider ? { provider: params.provider } : {}),
         mediaUrl: params.mediaUrl,
         caption: params.caption,

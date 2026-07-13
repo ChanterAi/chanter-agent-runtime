@@ -84,6 +84,28 @@ describe('createAutoPosterHttpPort — wiring', () => {
     assert.equal(calls[0]!.headers[RUNTIME_CONTROL_TOKEN_HEADER], TOKEN);
     assert.equal(calls[0]!.method, 'GET');
   });
+
+  it('adds optional workspace scope to list and status query parameters', async () => {
+    const { fetchImpl, calls } = makeFetch(() => ({ status: 200, json: { ok: true } }));
+    const port = makePort(fetchImpl);
+
+    await port.listQueue({ userId: 'owner', workspaceId: 'workspace-a', accountId: 'account-a', limit: 25 });
+    await port.getPostStatus({
+      userId: 'owner',
+      workspaceId: 'workspace-a',
+      accountId: 'account-a',
+      postId: 'post-1',
+    });
+
+    assert.equal(
+      calls[0]!.url,
+      'http://localhost:3010/api/runtime/queue?accountId=account-a&workspaceId=workspace-a&limit=25'
+    );
+    assert.equal(
+      calls[1]!.url,
+      'http://localhost:3010/api/runtime/posts/post-1/status?accountId=account-a&workspaceId=workspace-a'
+    );
+  });
 });
 
 describe('createAutoPosterHttpPort — status mapping', () => {
@@ -92,6 +114,7 @@ describe('createAutoPosterHttpPort — status mapping', () => {
     [403, 'forbidden'],
     [404, 'not_found'],
     [400, 'validation_failed'],
+    [409, 'validation_failed'],
     [422, 'validation_failed'],
     [503, 'unavailable'],
     [500, 'internal'],
@@ -115,6 +138,61 @@ describe('createAutoPosterHttpPort — status mapping', () => {
     const result = await port.getPostStatus({ userId: 'owner', postId: 'post-1' });
     assert.equal(result.ok, false);
     if (!result.ok) assert.equal(result.code, 'forbidden');
+  });
+
+  it('allowlists structured commercial denial facts and drops arbitrary response fields', async () => {
+    const { fetchImpl } = makeFetch(() => ({
+      status: 409,
+      json: {
+        ok: false,
+        code: 'monthly_post_limit_reached',
+        reason: 'Monthly scheduling limit reached.',
+        reasonCode: 'monthly_post_limit_reached',
+        current: 10,
+        limit: 10,
+        remaining: 0,
+        planId: 'starter',
+        workspaceId: 'workspace-a',
+        evaluationTimestamp: '2026-07-12T09:30:00+02:00',
+        planOverrides: { scheduledPostsPerCycle: 999999 },
+        customerId: 'must-not-cross-runtime-boundary',
+      },
+    }));
+    const port = makePort(fetchImpl);
+    const result = await port.listQueue({ userId: 'owner', workspaceId: 'workspace-a', limit: 5 });
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.code, 'forbidden');
+      assert.deepEqual(result.details, {
+        reasonCode: 'monthly_post_limit_reached',
+        current: 10,
+        limit: 10,
+        remaining: 0,
+        planId: 'starter',
+        workspaceId: 'workspace-a',
+        evaluationTimestamp: '2026-07-12T07:30:00.000Z',
+      });
+      assert.equal('planOverrides' in (result.details as Record<string, unknown>), false);
+      assert.equal('customerId' in (result.details as Record<string, unknown>), false);
+    }
+  });
+
+  it('maps an explicit unknown-workspace refusal to denied transport truth without changing ordinary 404s', async () => {
+    const { fetchImpl } = makeFetch(() => ({
+      status: 404,
+      json: {
+        ok: false,
+        code: 'workspace_not_found',
+        reason: 'Workspace not found for this authenticated owner.',
+      },
+    }));
+    const port = makePort(fetchImpl);
+    const result = await port.listQueue({ userId: 'owner', workspaceId: 'workspace-unknown', limit: 5 });
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.code, 'forbidden');
+      assert.deepEqual(result.details, { reasonCode: 'workspace_not_found' });
+    }
   });
 
   it('an HTTP 200 body without ok:true is refused, not trusted', async () => {
@@ -200,6 +278,34 @@ describe('createAutoPosterHttpPort — reachability and boundedness', () => {
     assert.equal(body.userId, undefined, 'tenant identity must be derived server-side from the token');
     assert.equal('provider' in body, false, 'a TikTok schedule carries no provider field (backward compatibility)');
     assert.equal('title' in body, false);
+  });
+
+  it('sends the optional workspace in the schedule body without plan claims', async () => {
+    const { fetchImpl, calls } = makeFetch(() => ({
+      status: 201,
+      json: {
+        ok: true,
+        duplicate: false,
+        post: { id: 'post-9', accountId: 'account-a', status: 'scheduled', scheduledAt: null, approved: false },
+      },
+    }));
+    const port = makePort(fetchImpl);
+    await port.schedulePost({
+      userId: 'owner',
+      workspaceId: 'workspace-a',
+      accountId: 'account-a',
+      mediaUrl: 'https://cdn.example.com/a.mp4',
+      caption: '',
+      hashtags: '',
+      scheduledAt: '2099-07-11T09:00:00.000Z',
+      idempotencyKey: 'idem-workspace',
+      requestedBy: 'mcp-client',
+    });
+
+    const body = JSON.parse(calls[0]!.body!) as Record<string, unknown>;
+    assert.equal(body.workspaceId, 'workspace-a');
+    assert.equal('planId' in body, false);
+    assert.equal('entitlements' in body, false);
   });
 
   it('a YouTube schedule carries provider, title, and description in the body', async () => {
