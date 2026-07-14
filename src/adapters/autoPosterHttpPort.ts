@@ -16,6 +16,12 @@
  * `fetchImpl` is injectable so tests never touch the network.
  */
 import type {
+  AutoPosterConnectedAccountListParams,
+  AutoPosterConnectedAccountListSuccess,
+  AutoPosterConnectedAccountValidationParams,
+  AutoPosterConnectedAccountValidationSuccess,
+  AutoPosterConnectedAccountView,
+  AutoPosterConnectedAccountReasonCode,
   AutoPosterMediaValidationParams,
   AutoPosterMediaValidationSuccess,
   AutoPosterOperationsPort,
@@ -29,6 +35,7 @@ import type {
   AutoPosterScheduleParams,
   AutoPosterScheduleSuccess,
 } from './autoPosterMissionAdapter.js';
+import { redactText } from '../redaction.js';
 
 export interface AutoPosterHttpPortOptions {
   /** Base URL of the AutoPoster server, e.g. 'http://localhost:3010'. */
@@ -86,22 +93,51 @@ const COMMERCIAL_DENIAL_REASON_CODES = new Set([
   'runtime_scheduling_not_allowed',
 ]);
 
+const CONNECTED_ACCOUNT_REASON_CODES = new Set<AutoPosterConnectedAccountReasonCode>([
+  'unknown_account_id',
+  'account_id_case_mismatch',
+  'account_id_non_canonical',
+  'account_workspace_mismatch',
+  'provider_account_mismatch',
+  'account_disconnected',
+  'account_not_publishing_ready',
+]);
+
+const CONNECTED_ACCOUNT_PROVIDERS = new Set(['tiktok', 'youtube']);
+const CONNECTED_ACCOUNT_READINESS_BLOCKERS = new Set([
+  'provider_not_active',
+  'account_disconnected',
+  'reauthorization_required',
+  'missing_video_publish_scope',
+]);
+
 function failure(
   code: AutoPosterPortErrorCode,
   message: string,
   details?: AutoPosterCommercialDenialDetails
 ): AutoPosterPortFailure {
-  return { ok: false, code, message, ...(details ? { details } : {}) };
+  return {
+    ok: false,
+    code,
+    message,
+    ...(details?.reasonCode ? { reasonCode: details.reasonCode } : {}),
+    ...(details ? { details } : {}),
+  };
 }
 
-function commercialDenialDetails(record: Record<string, unknown>): AutoPosterCommercialDenialDetails | undefined {
+function safeFailureDetails(record: Record<string, unknown>): AutoPosterCommercialDenialDetails | undefined {
   const details: AutoPosterCommercialDenialDetails = {};
-  const reasonCode =
+  const candidateReasonCode =
     typeof record.reasonCode === 'string' && record.reasonCode.trim()
       ? record.reasonCode.trim()
       : typeof record.code === 'string' && record.code.trim() && !isPortErrorCode(record.code)
         ? record.code.trim()
         : '';
+  const reasonCode = candidateReasonCode
+    && (COMMERCIAL_DENIAL_REASON_CODES.has(candidateReasonCode)
+      || CONNECTED_ACCOUNT_REASON_CODES.has(candidateReasonCode as AutoPosterConnectedAccountReasonCode))
+    ? candidateReasonCode
+    : '';
   if (reasonCode) details.reasonCode = reasonCode;
 
   for (const field of ['current', 'limit', 'remaining'] as const) {
@@ -113,6 +149,25 @@ function commercialDenialDetails(record: Record<string, unknown>): AutoPosterCom
   for (const field of ['planId', 'workspaceId'] as const) {
     const value = record[field];
     if (typeof value === 'string' && value.trim()) details[field] = value.trim();
+  }
+  if (CONNECTED_ACCOUNT_REASON_CODES.has(reasonCode as AutoPosterConnectedAccountReasonCode)) {
+    const accountId = record.accountId;
+    if (typeof accountId === 'string' && accountId.trim()) {
+      // Opaque provider ids are case-sensitive. Preserve the exact safe value.
+      details.accountId = accountId;
+    }
+    for (const field of ['provider', 'requestedProvider', 'accountProvider'] as const) {
+      const value = record[field];
+      if (typeof value === 'string' && CONNECTED_ACCOUNT_PROVIDERS.has(value)) details[field] = value;
+    }
+    if (Array.isArray(record.blockers)) {
+      const blockers = record.blockers
+        .filter((value): value is string => (
+          typeof value === 'string' && CONNECTED_ACCOUNT_READINESS_BLOCKERS.has(value)
+        ))
+        .slice(0, CONNECTED_ACCOUNT_READINESS_BLOCKERS.size);
+      if (blockers.length > 0) details.blockers = blockers;
+    }
   }
   if (
     typeof record.evaluationTimestamp === 'string'
@@ -139,6 +194,72 @@ function statusToErrorCode(status: number): AutoPosterPortErrorCode {
   if (status === 400 || status === 409 || status === 422) return 'validation_failed';
   if (status === 502 || status === 503 || status === 504) return 'unavailable';
   return 'internal';
+}
+
+const CONNECTION_STATUSES = new Set<AutoPosterConnectedAccountView['connectionStatus']>([
+  'connected',
+  'reauthorization_required',
+  'disconnected',
+]);
+
+function nonArrayRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+/**
+ * Projects one HTTP response account through a strict allowlist. Identity
+ * fields remain byte-exact; human-readable labels are defensively redacted.
+ */
+function connectedAccountView(value: unknown): AutoPosterConnectedAccountView | undefined {
+  const record = nonArrayRecord(value);
+  if (!record) return undefined;
+
+  const provider = typeof record.provider === 'string' ? record.provider : '';
+  const accountId = typeof record.accountId === 'string' ? record.accountId : '';
+  const connectedAccountId = typeof record.connectedAccountId === 'string' ? record.connectedAccountId : '';
+  const providerDisplayName = typeof record.providerDisplayName === 'string' ? record.providerDisplayName : '';
+  const username = typeof record.username === 'string' ? record.username : '';
+  const displayName = typeof record.displayName === 'string' ? record.displayName : '';
+  const connectionStatus = record.connectionStatus;
+  const publishingReady = record.publishingReady;
+  const blockers = record.readinessBlockers;
+  const lastVerifiedAt = record.lastVerifiedAt;
+
+  if (
+    !CONNECTED_ACCOUNT_PROVIDERS.has(provider)
+    || !accountId
+    || accountId !== accountId.trim()
+    || connectedAccountId !== `${provider}:${accountId}`
+    || !CONNECTION_STATUSES.has(connectionStatus as AutoPosterConnectedAccountView['connectionStatus'])
+    || typeof publishingReady !== 'boolean'
+    || !Array.isArray(blockers)
+    || blockers.some((blocker) => (
+      typeof blocker !== 'string' || !CONNECTED_ACCOUNT_READINESS_BLOCKERS.has(blocker)
+    ))
+    || (lastVerifiedAt !== null
+      && (typeof lastVerifiedAt !== 'string' || !Number.isFinite(Date.parse(lastVerifiedAt))))
+  ) {
+    return undefined;
+  }
+
+  return {
+    provider,
+    providerDisplayName: redactText(providerDisplayName),
+    accountId,
+    connectedAccountId,
+    username: redactText(username),
+    displayName: redactText(displayName),
+    connectionStatus: connectionStatus as AutoPosterConnectedAccountView['connectionStatus'],
+    publishingReady,
+    readinessBlockers: [...blockers] as string[],
+    lastVerifiedAt: lastVerifiedAt === null ? null : new Date(lastVerifiedAt as string).toISOString(),
+  };
+}
+
+function exactWorkspaceId(value: unknown): string | undefined {
+  return typeof value === 'string' && Boolean(value) && value === value.trim() ? value : undefined;
 }
 
 /** Builds the real HTTP-backed operations port. Throws immediately on missing wiring — fail closed at construction. */
@@ -213,13 +334,13 @@ export function createAutoPosterHttpPort(options: AutoPosterHttpPortOptions): Au
           : typeof record?.message === 'string'
             ? record.message
             : `HTTP ${response.status}`;
-      const details = commercialDenialDetails(record);
+      const details = safeFailureDetails(record);
       const code = isCommercialDenial(response.status, details)
         ? 'forbidden'
         : typeof record?.code === 'string' && isPortErrorCode(record.code)
           ? record.code
           : statusToErrorCode(response.status);
-      return failure(code, `AutoPoster refused ${method} ${path}: ${reason}`, details);
+      return failure(code, redactText(`AutoPoster refused ${method} ${path}: ${reason}`).slice(0, 500), details);
     }
     return record as unknown as TSuccess;
   }
@@ -259,6 +380,81 @@ export function createAutoPosterHttpPort(options: AutoPosterHttpPortOptions): Au
         idempotencyKey: params.idempotencyKey,
         requestedBy: params.requestedBy,
       }, params.traceId);
+    },
+    async listConnectedAccounts(params: AutoPosterConnectedAccountListParams) {
+      const query = new URLSearchParams();
+      if (params.workspaceId) query.set('workspaceId', params.workspaceId);
+      if (params.provider) query.set('provider', params.provider);
+      const suffix = query.size > 0 ? `?${query.toString()}` : '';
+      const result = await call<{
+        ok: true;
+        workspaceId?: unknown;
+        count?: unknown;
+        accounts?: unknown;
+      }>('GET', `/api/runtime/connected-accounts${suffix}`);
+      if (!result.ok) return result;
+
+      const workspaceId = exactWorkspaceId(result.workspaceId);
+      if (
+        !workspaceId
+        || (params.workspaceId !== undefined && workspaceId !== params.workspaceId)
+        || !Array.isArray(result.accounts)
+      ) {
+        return failure('internal', 'AutoPoster returned a malformed connected-account list response.');
+      }
+      const accounts = result.accounts.map(connectedAccountView);
+      if (
+        accounts.some((account) => account === undefined)
+        || !Number.isInteger(result.count)
+        || result.count !== accounts.length
+      ) {
+        return failure('internal', 'AutoPoster returned an unsafe connected-account list response.');
+      }
+      return {
+        ok: true,
+        workspaceId,
+        count: accounts.length,
+        accounts: accounts as AutoPosterConnectedAccountView[],
+      } satisfies AutoPosterConnectedAccountListSuccess;
+    },
+    async validateConnectedAccount(params: AutoPosterConnectedAccountValidationParams) {
+      const result = await call<{
+        ok: true;
+        workspaceId?: unknown;
+        account?: unknown;
+      }>('POST', '/api/runtime/connected-accounts/validate', {
+        ...(params.workspaceId ? { workspaceId: params.workspaceId } : {}),
+        provider: params.provider,
+        accountId: params.accountId,
+      });
+      if (!result.ok) return result;
+
+      const workspaceId = exactWorkspaceId(result.workspaceId);
+      const account = connectedAccountView(result.account);
+      if (
+        !workspaceId
+        || (params.workspaceId !== undefined && workspaceId !== params.workspaceId)
+        || !account
+      ) {
+        return failure('internal', 'AutoPoster returned an unsafe connected-account validation response.');
+      }
+      if (account.provider !== params.provider || account.accountId !== params.accountId) {
+        return failure(
+          'internal',
+          'AutoPoster validation did not confirm the exact requested provider and account id.'
+        );
+      }
+      if (
+        account.connectionStatus !== 'connected'
+        || account.publishingReady !== true
+        || account.readinessBlockers.length > 0
+      ) {
+        return failure(
+          'internal',
+          'AutoPoster validation returned an account that is not publishing-ready.'
+        );
+      }
+      return { ok: true, workspaceId, account } satisfies AutoPosterConnectedAccountValidationSuccess;
     },
   };
 }

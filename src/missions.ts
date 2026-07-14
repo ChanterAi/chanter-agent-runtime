@@ -157,6 +157,18 @@ export interface RuntimeMissionActionSpec {
   executionPolicy: RuntimeExecutionPolicy;
   /** True when a missing idempotency key must fail the mission closed. */
   requiresIdempotencyKey: boolean;
+  /**
+   * Optional product-owned validation for every identity field that affects
+   * replay scope. It runs before stored or in-flight results can be reused, so
+   * a malformed request cannot bypass adapter validation through a cache hit.
+   */
+  validateIdempotencyScope?: (request: RuntimeMissionRequest) => RuntimeMissionError[];
+  /**
+   * Optional product-owned canonical scope that participates in Runtime
+   * idempotency. This prevents one logical provider/resource scope from
+   * replaying another while keeping product normalization out of the core.
+   */
+  resolveIdempotencyScope?: (request: RuntimeMissionRequest) => string | null;
 }
 
 /**
@@ -214,25 +226,57 @@ export function createMissionAdapterRegistry(adapters: RuntimeMissionAdapter[]):
 
 /**
  * Records the result of every mission that actually reached an adapter. The
- * runtime supplies an opaque key scoped to product + tenant user + workspace
- * + caller idempotency key, preventing one tenant scope from replaying another
- * scope's result. Missions that never executed (validation/approval/policy
- * refusals) do not consume their key, so a corrected retry with the same
- * caller key still works.
+ * runtime supplies an opaque key scoped to product + action + tenant user +
+ * workspace + exact account + product-owned canonical scope + caller
+ * idempotency key, preventing one action or tenant/account/provider scope
+ * from replaying another scope's result. Missions that never executed
+ * (validation/approval/policy refusals) do not consume their key, so a
+ * corrected retry with the same caller key still works.
  */
 export interface RuntimeMissionIdempotencyStore {
   get(key: string): RuntimeMissionResult | undefined;
   set(key: string, result: RuntimeMissionResult): void;
 }
 
-function scopedIdempotencyStoreKey(request: RuntimeMissionRequest, callerKey: string): string {
+function scopedIdempotencyStoreKey(
+  request: RuntimeMissionRequest,
+  spec: RuntimeMissionActionSpec,
+  callerKey: string
+): string {
   return JSON.stringify([
-    'runtime-mission-idempotency-v2',
+    'runtime-mission-idempotency-v4',
     request.product,
+    request.action,
     request.tenant.userId.trim(),
-    request.tenant.workspaceId?.trim() || null,
+    // A supplied workspace is part of the exact replay identity. Product
+    // validation rejects non-canonical values before this key is consulted.
+    request.tenant.workspaceId ?? null,
+    // Account ids are opaque and case-sensitive. Upstream canonical
+    // selection supplies tenant.accountId; preserve it byte-for-byte.
+    request.tenant.accountId ?? null,
+    spec.resolveIdempotencyScope?.(request) ?? null,
     callerKey,
   ]);
+}
+
+/**
+ * Per-store in-flight executions close the async get-then-set window without
+ * changing the public store interface. Only missions that clear validation,
+ * approval, and policy gates are registered here.
+ */
+const inFlightByStore = new WeakMap<
+  RuntimeMissionIdempotencyStore,
+  Map<string, Promise<RuntimeMissionResult>>
+>();
+
+function inFlightExecutions(
+  store: RuntimeMissionIdempotencyStore
+): Map<string, Promise<RuntimeMissionResult>> {
+  const existing = inFlightByStore.get(store);
+  if (existing) return existing;
+  const created = new Map<string, Promise<RuntimeMissionResult>>();
+  inFlightByStore.set(store, created);
+  return created;
 }
 
 /** Simple per-process Map-backed store. Durable stores can implement the same interface. */
@@ -392,23 +436,46 @@ export async function executeMission(
 
   // 4. Idempotency replay — a key that already executed returns the stored
   //    result as an explicit duplicate instead of executing twice.
+  // Product-owned replay scope must be valid before either the durable cache
+  // or the in-flight coalescing map is consulted. In particular, a malformed
+  // account/provider/workspace request must never inherit a prior success.
+  const idempotencyScopeErrors = spec.validateIdempotencyScope?.(request) ?? [];
+  if (idempotencyScopeErrors.length > 0) {
+    return finish({ status: 'validation_failed', errors: idempotencyScopeErrors });
+  }
+
   const store = options.idempotencyStore;
-  const storeKey = idempotencyKey ? scopedIdempotencyStoreKey(request, idempotencyKey) : null;
+  const storeKey = idempotencyKey ? scopedIdempotencyStoreKey(request, spec, idempotencyKey) : null;
+  const replayExisting = (
+    existing: RuntimeMissionResult,
+    source: 'stored' | 'concurrent'
+  ): RuntimeMissionResult => {
+    const accepted = existing.status === 'succeeded' || existing.status === 'duplicate';
+    const replayMessage = source === 'concurrent'
+      ? `Idempotency key is already executing in mission ${existing.missionId}; this request shared its result and performed no second execution.`
+      : `Idempotency key was already executed by mission ${existing.missionId} (status: ${existing.status}); no second execution was performed.`;
+    return finish({
+      // A coalesced failure remains a failure. It is never converted into a
+      // non-error duplicate, and no automatic retry is attempted.
+      status: accepted ? 'duplicate' : existing.status,
+      output: existing.output,
+      evidence: existing.evidence,
+      warnings: [...existing.warnings, replayMessage],
+      errors: existing.errors,
+      policyDecision: existing.policyDecision,
+      approvalDecision: existing.approvalDecision,
+      idempotency: { key: idempotencyKey, outcome: 'duplicate', originalMissionId: existing.missionId },
+    });
+  };
   if (storeKey && store) {
     const existing = store.get(storeKey);
     if (existing) {
-      return finish({
-        status: 'duplicate',
-        output: existing.output,
-        evidence: existing.evidence,
-        warnings: [
-          `Idempotency key was already executed by mission ${existing.missionId} (status: ${existing.status}); no second execution was performed.`,
-        ],
-        errors: existing.errors,
-        policyDecision: existing.policyDecision,
-        approvalDecision: existing.approvalDecision,
-        idempotency: { key: idempotencyKey, outcome: 'duplicate', originalMissionId: existing.missionId },
-      });
+      return replayExisting(existing, 'stored');
+    }
+    const inFlight = inFlightExecutions(store).get(storeKey);
+    if (inFlight) {
+      const existingInFlightResult = await inFlight;
+      return replayExisting(existingInFlightResult, 'concurrent');
     }
   }
 
@@ -488,79 +555,95 @@ export async function executeMission(
   }
 
   // 8. Adapter execution — exceptions become truthful failures, never success.
-  task = startExecution(task);
-  let outcome: RuntimeMissionAdapterOutcome;
-  try {
-    outcome = await adapter.execute(request, spec);
-  } catch (error) {
-    outcome = {
-      ok: false,
-      status: 'failed',
-      errors: [
-        {
-          code: 'ADAPTER_EXCEPTION',
-          message: error instanceof Error ? error.message : String(error),
-        },
-      ],
-    };
+  const executeAfterGates = async (): Promise<RuntimeMissionResult> => {
+    task = startExecution(task);
+    let outcome: RuntimeMissionAdapterOutcome;
+    try {
+      outcome = await adapter.execute(request, spec);
+    } catch (error) {
+      outcome = {
+        ok: false,
+        status: 'failed',
+        errors: [
+          {
+            code: 'ADAPTER_EXCEPTION',
+            message: error instanceof Error ? error.message : String(error),
+          },
+        ],
+      };
+    }
+
+    for (const evidenceInput of outcome.evidence ?? []) {
+      task = attachEvidence(task, evidenceInput);
+    }
+
+    // 9. Validation + terminal transition, driven by the adapter's truthful outcome.
+    task = startValidation(task);
+    // Redacted here because this text is embedded into the task result summary,
+    // which the runtime treats as caller-supplied safe text (see evidence.ts).
+    const checkMessage =
+      outcome.errors && outcome.errors.length > 0
+        ? redactText(outcome.errors.map((error) => `${error.code}: ${error.message}`).join('; '))
+        : undefined;
+    const checks = [
+      {
+        command: `adapter:${adapter.id}:${spec.action}`,
+        passed: outcome.ok,
+        ...(checkMessage !== undefined ? { message: checkMessage } : {}),
+      },
+    ];
+    const summary = outcome.ok
+      ? `${spec.action} completed via ${adapter.id}.`
+      : `${spec.action} did not complete: ${checkMessage ?? 'downstream failure'}.`;
+    if (outcome.ok) {
+      task = passValidation(task, { checks });
+      task = completeTask(task, { summary, ...(outcome.output !== undefined ? { output: outcome.output } : {}) });
+    } else {
+      task = failValidation(task, { checks });
+      task = failTask(task, { summary, ...(outcome.output !== undefined ? { output: outcome.output } : {}) });
+    }
+
+    const status: RuntimeMissionStatus = outcome.ok
+      ? outcome.status === 'duplicate'
+        ? 'duplicate'
+        : 'succeeded'
+      : outcome.status && outcome.status !== 'succeeded'
+        ? outcome.status
+        : 'failed';
+
+    const result = finish({
+      status,
+      output: outcome.output ?? null,
+      evidence: createEvidenceBundle(task),
+      warnings: outcome.warnings,
+      errors: outcome.errors,
+      policyDecision,
+      approvalDecision,
+      idempotency: idempotencyKey
+        ? { key: idempotencyKey, outcome: status === 'duplicate' ? 'duplicate' : 'first_execution' }
+        : { key: null, outcome: 'not_applicable' },
+    });
+
+    // 10. Only successful/duplicate downstream outcomes consume the Runtime
+    // idempotency key. A refusal or unavailable dependency has no accepted side
+    // effect to replay, and must remain retryable under corrected server truth.
+    if (storeKey && store && outcome.ok) {
+      store.set(storeKey, result);
+    }
+    return result;
+  };
+
+  if (storeKey && store) {
+    const inFlight = inFlightExecutions(store);
+    // Schedule execution in a microtask so the reservation is visible before
+    // any adapter code can re-enter this runtime with the same scoped key.
+    const execution = Promise.resolve().then(executeAfterGates);
+    inFlight.set(storeKey, execution);
+    try {
+      return await execution;
+    } finally {
+      if (inFlight.get(storeKey) === execution) inFlight.delete(storeKey);
+    }
   }
-
-  for (const evidenceInput of outcome.evidence ?? []) {
-    task = attachEvidence(task, evidenceInput);
-  }
-
-  // 9. Validation + terminal transition, driven by the adapter's truthful outcome.
-  task = startValidation(task);
-  // Redacted here because this text is embedded into the task result summary,
-  // which the runtime treats as caller-supplied safe text (see evidence.ts).
-  const checkMessage =
-    outcome.errors && outcome.errors.length > 0
-      ? redactText(outcome.errors.map((error) => `${error.code}: ${error.message}`).join('; '))
-      : undefined;
-  const checks = [
-    {
-      command: `adapter:${adapter.id}:${spec.action}`,
-      passed: outcome.ok,
-      ...(checkMessage !== undefined ? { message: checkMessage } : {}),
-    },
-  ];
-  const summary = outcome.ok
-    ? `${spec.action} completed via ${adapter.id}.`
-    : `${spec.action} did not complete: ${checkMessage ?? 'downstream failure'}.`;
-  if (outcome.ok) {
-    task = passValidation(task, { checks });
-    task = completeTask(task, { summary, ...(outcome.output !== undefined ? { output: outcome.output } : {}) });
-  } else {
-    task = failValidation(task, { checks });
-    task = failTask(task, { summary, ...(outcome.output !== undefined ? { output: outcome.output } : {}) });
-  }
-
-  const status: RuntimeMissionStatus = outcome.ok
-    ? outcome.status === 'duplicate'
-      ? 'duplicate'
-      : 'succeeded'
-    : outcome.status && outcome.status !== 'succeeded'
-      ? outcome.status
-      : 'failed';
-
-  const result = finish({
-    status,
-    output: outcome.output ?? null,
-    evidence: createEvidenceBundle(task),
-    warnings: outcome.warnings,
-    errors: outcome.errors,
-    policyDecision,
-    approvalDecision,
-    idempotency: idempotencyKey
-      ? { key: idempotencyKey, outcome: 'first_execution' }
-      : { key: null, outcome: 'not_applicable' },
-  });
-
-  // 10. Only successful/duplicate downstream outcomes consume the Runtime
-  // idempotency key. A refusal or unavailable dependency has no accepted side
-  // effect to replay, and must remain retryable under corrected server truth.
-  if (storeKey && store && outcome.ok) {
-    store.set(storeKey, result);
-  }
-  return result;
+  return executeAfterGates();
 }

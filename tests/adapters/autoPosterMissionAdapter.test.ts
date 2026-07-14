@@ -304,14 +304,17 @@ describe('autoposter.media.validate', () => {
 });
 
 describe('autoposter.post.schedule', () => {
-  const approvedSchedule = (input: Record<string, unknown>, extra: Partial<RuntimeMissionRequest> = {}) =>
-    ({
+  const approvedSchedule = (input: Record<string, unknown>, extra: Partial<RuntimeMissionRequest> = {}) => {
+    const inputAccountId = typeof input.accountId === 'string' ? input.accountId : undefined;
+    return ({
       action: AUTOPOSTER_ACTIONS.postSchedule,
       idempotencyKey: 'idem-1',
       approval: { approved: true, approvedBy: 'founder' },
+      tenant: { userId: 'owner', ...(inputAccountId !== undefined ? { accountId: inputAccountId } : {}) },
       input: input as RuntimeMissionRequest['input'],
       ...extra,
     }) satisfies Partial<RuntimeMissionRequest>;
+  };
 
   it('valid approved scheduling calls the port exactly once with normalized UTC time', async () => {
     const scheduledAt = futureIso();
@@ -402,7 +405,7 @@ describe('autoposter.post.schedule', () => {
           planId: 'studio',
           remaining: 999999,
         },
-        { tenant: { userId: 'owner', workspaceId: 'workspace-a' } }
+        { tenant: { userId: 'owner', workspaceId: 'workspace-a', accountId: 'account-a' } }
       )
     );
     assert.equal(result.status, 'succeeded');
@@ -412,12 +415,206 @@ describe('autoposter.post.schedule', () => {
     assert.equal('remaining' in params, false);
   });
 
+  it('rejects an input account that differs byte-for-byte from the canonical tenant account', async () => {
+    const { result, calls } = await run(
+      {},
+      approvedSchedule(
+        {
+          accountId: 'casesensitive-openid',
+          mediaUrl: 'https://cdn.example.com/a.mp4',
+          scheduledAt: futureIso(),
+        },
+        { tenant: { userId: 'owner', workspaceId: 'workspace-a', accountId: 'CaseSensitive-OpenId' } }
+      )
+    );
+    assert.equal(result.status, 'validation_failed');
+    assert.equal(result.errors[0]!.code, 'ACCOUNT_SCOPE_MISMATCH');
+    assert.equal(calls.schedulePost.length, 0);
+  });
+
+  it('rejects a missing tenant account before the operations port is called', async () => {
+    const { result, calls } = await run(
+      {},
+      approvedSchedule(
+        { accountId: 'account-a', mediaUrl: 'https://cdn.example.com/a.mp4', scheduledAt: futureIso() },
+        { tenant: { userId: 'owner', workspaceId: 'workspace-a' } }
+      )
+    );
+    assert.equal(result.status, 'validation_failed');
+    assert.equal(result.errors[0]!.code, 'MISSING_ACCOUNT_ID');
+    assert.equal(calls.schedulePost.length, 0);
+  });
+
+  it('rejects a missing input account before the operations port is called', async () => {
+    const { result, calls } = await run(
+      {},
+      approvedSchedule(
+        { mediaUrl: 'https://cdn.example.com/a.mp4', scheduledAt: futureIso() },
+        { tenant: { userId: 'owner', workspaceId: 'workspace-a', accountId: 'account-a' } }
+      )
+    );
+    assert.equal(result.status, 'validation_failed');
+    assert.equal(result.errors[0]!.code, 'MISSING_ACCOUNT_ID');
+    assert.equal(calls.schedulePost.length, 0);
+  });
+
+  it('isolates one caller key and raw account id across canonical provider scopes', async () => {
+    const { port, calls } = makeFakePort();
+    const registry = createMissionAdapterRegistry([createAutoPosterMissionAdapter(port)]);
+    const idempotencyStore = createInMemoryIdempotencyStore();
+    const scheduledAt = futureIso();
+
+    const tiktok = await executeMission(
+      makeRequest(
+        approvedSchedule(
+          { accountId: 'shared-channel-id', mediaUrl: 'https://cdn.example.com/tiktok.mp4', scheduledAt },
+          { missionId: 'mission-tiktok' }
+        )
+      ),
+      { registry, idempotencyStore }
+    );
+    const youtube = await executeMission(
+      makeRequest(
+        approvedSchedule(
+          {
+            provider: 'youtube',
+            accountId: 'shared-channel-id',
+            mediaUrl: 'https://cdn.example.com/youtube.mp4',
+            scheduledAt,
+            title: 'Provider-scoped launch',
+          },
+          { missionId: 'mission-youtube' }
+        )
+      ),
+      { registry, idempotencyStore }
+    );
+    const explicitTiktokReplay = await executeMission(
+      makeRequest(
+        approvedSchedule(
+          {
+            provider: 'tiktok',
+            accountId: 'shared-channel-id',
+            mediaUrl: 'https://cdn.example.com/tiktok-retry.mp4',
+            scheduledAt,
+          },
+          { missionId: 'mission-tiktok-replay' }
+        )
+      ),
+      { registry, idempotencyStore }
+    );
+
+    assert.equal(tiktok.status, 'succeeded');
+    assert.equal(youtube.status, 'succeeded');
+    assert.equal(explicitTiktokReplay.status, 'duplicate');
+    assert.equal(tiktok.idempotency.outcome, 'first_execution');
+    assert.equal(youtube.idempotency.outcome, 'first_execution');
+    assert.equal(explicitTiktokReplay.idempotency.originalMissionId, 'mission-tiktok');
+    assert.equal((tiktok.output as { post: { provider: string } }).post.provider, 'tiktok');
+    assert.equal((youtube.output as { post: { provider: string } }).post.provider, 'youtube');
+    assert.equal(calls.schedulePost.length, 2);
+    assert.equal('provider' in (calls.schedulePost[0] as Record<string, unknown>), false);
+    assert.equal((calls.schedulePost[1] as { provider: string }).provider, 'youtube');
+  });
+
+  it('validates the exact replay scope before reusing a canonical schedule result', async () => {
+    const { port, calls } = makeFakePort();
+    const registry = createMissionAdapterRegistry([createAutoPosterMissionAdapter(port)]);
+    const idempotencyStore = createInMemoryIdempotencyStore();
+    const scheduledAt = futureIso();
+    const accountId = 'CaseSensitive-OpenId';
+    const baseInput = {
+      provider: 'tiktok',
+      accountId,
+      mediaUrl: 'https://cdn.example.com/canonical.mp4',
+      scheduledAt,
+    };
+    const baseTenant = { userId: 'owner', workspaceId: 'workspace-a', accountId };
+    const execute = (missionId: string, input: Record<string, unknown>, tenant = baseTenant) => executeMission(
+      makeRequest(approvedSchedule(input, {
+        missionId,
+        idempotencyKey: 'exact-replay-scope',
+        tenant,
+      })),
+      { registry, idempotencyStore }
+    );
+
+    const first = await execute('mission-canonical', baseInput);
+    const exactReplay = await execute('mission-canonical-replay', {
+      ...baseInput,
+      mediaUrl: 'https://cdn.example.com/replay.mp4',
+    });
+
+    assert.equal(first.status, 'succeeded');
+    assert.equal(exactReplay.status, 'duplicate');
+    assert.equal(exactReplay.idempotency.originalMissionId, 'mission-canonical');
+    assert.equal((exactReplay.output as { post: { id: string } }).post.id, 'post-new');
+    assert.equal(calls.schedulePost.length, 1);
+
+    const malformedCases: Array<{
+      label: string;
+      input: Record<string, unknown>;
+      tenant?: typeof baseTenant;
+      expectedCode: string;
+    }> = [
+      {
+        label: 'account-case',
+        input: { ...baseInput, accountId: 'casesensitive-openid' },
+        expectedCode: 'ACCOUNT_SCOPE_MISMATCH',
+      },
+      {
+        label: 'account-leading-whitespace',
+        input: { ...baseInput, accountId: ` ${accountId}` },
+        expectedCode: 'ACCOUNT_SCOPE_MISMATCH',
+      },
+      {
+        label: 'account-trailing-whitespace',
+        input: { ...baseInput, accountId: `${accountId} ` },
+        expectedCode: 'ACCOUNT_SCOPE_MISMATCH',
+      },
+      {
+        label: 'account-value',
+        input: { ...baseInput, accountId: 'Different-OpenId' },
+        expectedCode: 'ACCOUNT_SCOPE_MISMATCH',
+      },
+      {
+        label: 'workspace-whitespace',
+        input: baseInput,
+        tenant: { ...baseTenant, workspaceId: ' workspace-a ' },
+        expectedCode: 'WORKSPACE_SCOPE_MISMATCH',
+      },
+      {
+        label: 'provider-case',
+        input: { ...baseInput, provider: 'TikTok' },
+        expectedCode: 'PROVIDER_SCOPE_MISMATCH',
+      },
+      {
+        label: 'provider-whitespace',
+        input: { ...baseInput, provider: ' tiktok ' },
+        expectedCode: 'PROVIDER_SCOPE_MISMATCH',
+      },
+    ];
+
+    for (const malformed of malformedCases) {
+      const result = await execute(
+        `mission-malformed-${malformed.label}`,
+        malformed.input,
+        malformed.tenant ?? baseTenant
+      );
+      assert.equal(result.status, 'validation_failed', malformed.label);
+      assert.equal(result.errors[0]!.code, malformed.expectedCode, malformed.label);
+      assert.equal(result.output, null, malformed.label);
+      assert.equal(result.evidence, null, malformed.label);
+    }
+    assert.equal(calls.schedulePost.length, 1, 'malformed replays never reach AutoPoster or reuse cached evidence');
+  });
+
   it('missing approval never reaches the port', async () => {
     const { result, calls } = await run(
       {},
       {
         action: AUTOPOSTER_ACTIONS.postSchedule,
         idempotencyKey: 'idem-2',
+        tenant: { userId: 'owner', accountId: 'account-a' },
         input: { accountId: 'account-a', mediaUrl: 'https://cdn.example.com/a.mp4', scheduledAt: futureIso() },
       }
     );
@@ -439,6 +636,7 @@ describe('autoposter.post.schedule', () => {
       approvedSchedule({ accountId: 'account-a', mediaUrl: 'https://cdn.example.com/a.mp4', scheduledAt: futureIso() })
     );
     assert.equal(result.status, 'duplicate');
+    assert.equal(result.idempotency.outcome, 'duplicate');
     const output = result.output as { duplicate: boolean; post: { id: string } };
     assert.equal(output.duplicate, true);
     assert.equal(output.post.id, 'post-existing');
@@ -486,6 +684,42 @@ describe('autoposter.post.schedule', () => {
     assert.equal(result.errors[0]!.code, 'AUTOPOSTER_FORBIDDEN');
   });
 
+  it('maps allowlisted downstream account reason codes onto exact Runtime errors', async () => {
+    const cases = [
+      ['unknown_account_id', 'AUTOPOSTER_UNKNOWN_ACCOUNT_ID'],
+      ['account_id_case_mismatch', 'AUTOPOSTER_ACCOUNT_ID_CASE_MISMATCH'],
+      ['account_id_non_canonical', 'AUTOPOSTER_ACCOUNT_ID_NON_CANONICAL'],
+      ['account_workspace_mismatch', 'AUTOPOSTER_ACCOUNT_WORKSPACE_MISMATCH'],
+      ['provider_account_mismatch', 'AUTOPOSTER_PROVIDER_ACCOUNT_MISMATCH'],
+      ['account_disconnected', 'AUTOPOSTER_ACCOUNT_DISCONNECTED'],
+      ['account_not_publishing_ready', 'AUTOPOSTER_ACCOUNT_NOT_PUBLISHING_READY'],
+    ] as const;
+
+    for (const [reasonCode, expectedCode] of cases) {
+      const { result } = await run(
+        {
+          async schedulePost() {
+            return {
+              ok: false,
+              code: 'validation_failed',
+              reasonCode,
+              message: `AutoPoster refused the account: ${reasonCode}.`,
+              details: { reasonCode, accountId: 'CaseSensitive-OpenId' },
+            } as AutoPosterPortFailure;
+          },
+        },
+        approvedSchedule({
+          accountId: 'CaseSensitive-OpenId',
+          mediaUrl: 'https://cdn.example.com/a.mp4',
+          scheduledAt: futureIso(),
+        })
+      );
+      assert.equal(result.status, 'validation_failed');
+      assert.equal(result.errors[0]!.code, expectedCode);
+      assert.equal((result.output as { reasonCode: string }).reasonCode, reasonCode);
+    }
+  });
+
   it('preserves allowlisted server-side commercial denial facts in mission output', async () => {
     const details = {
       reasonCode: 'runtime_scheduling_not_allowed',
@@ -508,7 +742,7 @@ describe('autoposter.post.schedule', () => {
       },
       approvedSchedule(
         { accountId: 'account-a', mediaUrl: 'https://cdn.example.com/a.mp4', scheduledAt: futureIso() },
-        { tenant: { userId: 'owner', workspaceId: 'workspace-a' } }
+        { tenant: { userId: 'owner', workspaceId: 'workspace-a', accountId: 'account-a' } }
       )
     );
     assert.equal(result.status, 'denied');
@@ -529,6 +763,63 @@ describe('autoposter.post.schedule', () => {
     assert.equal(result.evidence!.result!.success, false);
     const serialized = JSON.stringify(result);
     assert.ok(!serialized.includes('"status":"succeeded"'));
+  });
+
+  it('preserves an exact opaque downstream queue id in output and evidence', async () => {
+    const opaquePostId = 'Queue-ID:CaseSensitive/01~opaque';
+    const { result } = await run(
+      {
+        async schedulePost(params) {
+          return {
+            ok: true,
+            duplicate: false,
+            post: {
+              id: opaquePostId,
+              accountId: params.accountId,
+              provider: params.provider ?? 'tiktok',
+              status: 'scheduled',
+              scheduledAt: params.scheduledAt,
+              approved: false,
+            },
+          };
+        },
+      },
+      approvedSchedule({ accountId: 'account-a', mediaUrl: 'https://cdn.example.com/a.mp4', scheduledAt: futureIso() })
+    );
+
+    assert.equal(result.status, 'succeeded');
+    assert.equal((result.output as { post: { id: string } }).post.id, opaquePostId);
+    assert.equal(JSON.stringify(result.evidence).includes(opaquePostId), true);
+  });
+
+  it('rejects whitespace-altered or non-string downstream queue ids without transformed evidence', async () => {
+    for (const malformedId of [' post-opaque', 'post-opaque ', '\tpost-opaque', 42]) {
+      const { result } = await run(
+        {
+          async schedulePost(params) {
+            return {
+              ok: true,
+              duplicate: false,
+              post: {
+                id: malformedId,
+                accountId: params.accountId,
+                provider: params.provider ?? 'tiktok',
+                status: 'scheduled',
+                scheduledAt: params.scheduledAt,
+                approved: false,
+              },
+            } as unknown as Awaited<ReturnType<AutoPosterOperationsPort['schedulePost']>>;
+          },
+        },
+        approvedSchedule({ accountId: 'account-a', mediaUrl: 'https://cdn.example.com/a.mp4', scheduledAt: futureIso() })
+      );
+
+      assert.equal(result.status, 'failed');
+      assert.equal(result.errors[0]!.code, 'AUTOPOSTER_INVALID_SCHEDULE_RESPONSE');
+      assert.equal(result.output, null);
+      assert.equal(result.evidence!.result!.success, false);
+      assert.equal(result.evidence!.evidence.some((item) => item.label.includes('schedule-created')), false);
+    }
   });
 
   it('rejects schedule responses that do not prove an identifiable, unapproved queue draft', async () => {

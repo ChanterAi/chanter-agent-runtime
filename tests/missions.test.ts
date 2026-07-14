@@ -267,6 +267,66 @@ describe('executeMission — idempotency', () => {
     assert.equal(calls.length, 2, 'workspace B executes once; only the replay in workspace A is deduplicated');
   });
 
+  it('isolates one caller key across actions and exact canonical account ids', async () => {
+    const calls: RuntimeMissionRequest[] = [];
+    const { adapter } = makeAdapter({
+      async execute(request) {
+        calls.push(request);
+        return {
+          ok: true,
+          output: { action: request.action, accountId: request.tenant.accountId ?? null },
+        };
+      },
+    });
+    const registry = createMissionAdapterRegistry([adapter]);
+    const store = createInMemoryIdempotencyStore();
+    const tenantA = { userId: 'owner', workspaceId: 'workspace-a', accountId: 'CaseSensitive-A' };
+    const tenantB = { ...tenantA, accountId: 'casesensitive-a' };
+
+    const read = await executeMission(
+      makeRequest({ missionId: 'mission-read', action: 'test.read', tenant: tenantA, idempotencyKey: 'shared-key' }),
+      { registry, idempotencyStore: store }
+    );
+    const writeA = await executeMission(
+      makeRequest({
+        missionId: 'mission-write-a',
+        action: 'test.write',
+        tenant: tenantA,
+        idempotencyKey: 'shared-key',
+        approval: { approved: true, approvedBy: 'founder' },
+      }),
+      { registry, idempotencyStore: store }
+    );
+    const writeB = await executeMission(
+      makeRequest({
+        missionId: 'mission-write-b',
+        action: 'test.write',
+        tenant: tenantB,
+        idempotencyKey: 'shared-key',
+        approval: { approved: true, approvedBy: 'founder' },
+      }),
+      { registry, idempotencyStore: store }
+    );
+    const replayA = await executeMission(
+      makeRequest({
+        missionId: 'mission-write-a-replay',
+        action: 'test.write',
+        tenant: tenantA,
+        idempotencyKey: 'shared-key',
+        approval: { approved: true, approvedBy: 'founder' },
+      }),
+      { registry, idempotencyStore: store }
+    );
+
+    assert.equal(read.status, 'succeeded');
+    assert.equal(writeA.status, 'succeeded');
+    assert.equal(writeB.status, 'succeeded');
+    assert.deepEqual(writeB.output, { action: 'test.write', accountId: 'casesensitive-a' });
+    assert.equal(replayA.status, 'duplicate');
+    assert.equal(replayA.idempotency.originalMissionId, 'mission-write-a');
+    assert.equal(calls.length, 3);
+  });
+
   it('an approval-refused mission does not consume its idempotency key', async () => {
     const { adapter, calls } = makeAdapter();
     const registry = createMissionAdapterRegistry([adapter]);
@@ -327,6 +387,78 @@ describe('executeMission — idempotency', () => {
     assert.equal(retried.status, 'succeeded');
     assert.equal(retried.idempotency.outcome, 'first_execution');
     assert.equal(attempts, 2);
+  });
+
+  it('coalesces concurrent same-scope execution and invokes the adapter once', async () => {
+    let attempts = 0;
+    const { adapter } = makeAdapter({
+      async execute() {
+        attempts += 1;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return { ok: true, output: { accepted: true } };
+      },
+    });
+    const registry = createMissionAdapterRegistry([adapter]);
+    const store = createInMemoryIdempotencyStore();
+    const base = {
+      action: 'test.write',
+      tenant: { userId: 'owner', workspaceId: 'workspace-a', accountId: 'Account-A' },
+      idempotencyKey: 'concurrent-key',
+      approval: { approved: true, approvedBy: 'founder' },
+    };
+
+    const [first, replay] = await Promise.all([
+      executeMission(makeRequest({ ...base, missionId: 'mission-concurrent-a' }), { registry, idempotencyStore: store }),
+      executeMission(makeRequest({ ...base, missionId: 'mission-concurrent-b' }), { registry, idempotencyStore: store }),
+    ]);
+
+    assert.equal(first.status, 'succeeded');
+    assert.equal(first.idempotency.outcome, 'first_execution');
+    assert.equal(replay.status, 'duplicate');
+    assert.equal(replay.idempotency.outcome, 'duplicate');
+    assert.equal(replay.idempotency.originalMissionId, 'mission-concurrent-a');
+    assert.equal(attempts, 1);
+  });
+
+  it('shares a concurrent typed failure without automatically retrying it', async () => {
+    let attempts = 0;
+    const { adapter } = makeAdapter({
+      async execute() {
+        attempts += 1;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return {
+          ok: false,
+          status: 'denied',
+          errors: [{ code: 'AUTOPOSTER_ACCOUNT_DISCONNECTED', message: 'Reconnect the selected account.' }],
+        };
+      },
+    });
+    const registry = createMissionAdapterRegistry([adapter]);
+    const store = createInMemoryIdempotencyStore();
+    const base = {
+      action: 'test.write',
+      tenant: { userId: 'owner', workspaceId: 'workspace-a', accountId: 'Account-A' },
+      idempotencyKey: 'concurrent-denial-key',
+      approval: { approved: true, approvedBy: 'founder' },
+    };
+
+    const [first, replay] = await Promise.all([
+      executeMission(makeRequest({ ...base, missionId: 'mission-denial-a' }), { registry, idempotencyStore: store }),
+      executeMission(makeRequest({ ...base, missionId: 'mission-denial-b' }), { registry, idempotencyStore: store }),
+    ]);
+    assert.equal(first.status, 'denied');
+    assert.equal(replay.status, 'denied');
+    assert.equal(replay.errors[0]!.code, 'AUTOPOSTER_ACCOUNT_DISCONNECTED');
+    assert.equal(replay.idempotency.outcome, 'duplicate');
+    assert.equal(attempts, 1, 'the concurrent request shares the refusal instead of retrying');
+
+    const manualRetry = await executeMission(makeRequest({ ...base, missionId: 'mission-denial-retry' }), {
+      registry,
+      idempotencyStore: store,
+    });
+    assert.equal(manualRetry.status, 'denied');
+    assert.equal(manualRetry.idempotency.outcome, 'first_execution');
+    assert.equal(attempts, 2, 'a later explicit retry remains possible because failures are not cached');
   });
 });
 

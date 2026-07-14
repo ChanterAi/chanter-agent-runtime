@@ -108,6 +108,202 @@ describe('createAutoPosterHttpPort — wiring', () => {
   });
 });
 
+describe('createAutoPosterHttpPort — safe connected-account preflight', () => {
+  const canonicalAccount = {
+    provider: 'tiktok',
+    providerDisplayName: 'TikTok',
+    accountId: 'CaseSensitive-OpenId',
+    connectedAccountId: 'tiktok:CaseSensitive-OpenId',
+    username: 'creator',
+    displayName: 'CHANTER Creator',
+    connectionStatus: 'connected',
+    publishingReady: true,
+    readinessBlockers: [],
+    lastVerifiedAt: '2026-07-14T07:00:00+03:00',
+  };
+
+  it('lists and validates exact canonical ids through the new bounded paths', async () => {
+    const { fetchImpl, calls } = makeFetch((call) => call.method === 'GET'
+      ? {
+          status: 200,
+          json: {
+            ok: true,
+            workspaceId: 'workspace-a',
+            count: 1,
+            accounts: [{
+              ...canonicalAccount,
+              username: 'TOKEN=abc123DEF456ghi789JKL012mno345PQR',
+              ownerUserId: 'must-not-cross',
+              accessToken: 'provider-secret-must-not-cross',
+              authorization: { scopes: ['video.publish'] },
+              providerPayload: { raw: true },
+            }],
+          },
+        }
+      : {
+          status: 200,
+          json: { ok: true, workspaceId: 'workspace-a', account: canonicalAccount },
+        });
+    const port = makePort(fetchImpl);
+
+    const listed = await port.listConnectedAccounts!({
+      userId: 'owner',
+      workspaceId: 'workspace-a',
+      provider: 'tiktok',
+    });
+    const validated = await port.validateConnectedAccount!({
+      userId: 'owner',
+      workspaceId: 'workspace-a',
+      provider: 'tiktok',
+      accountId: 'CaseSensitive-OpenId',
+    });
+
+    assert.equal(calls[0]!.url, 'http://localhost:3010/api/runtime/connected-accounts?workspaceId=workspace-a&provider=tiktok');
+    assert.equal(calls[0]!.method, 'GET');
+    assert.equal(calls[1]!.url, 'http://localhost:3010/api/runtime/connected-accounts/validate');
+    assert.equal(calls[1]!.method, 'POST');
+    assert.deepEqual(JSON.parse(calls[1]!.body!), {
+      workspaceId: 'workspace-a',
+      provider: 'tiktok',
+      accountId: 'CaseSensitive-OpenId',
+    });
+
+    assert.equal(listed.ok, true);
+    if (listed.ok) {
+      assert.equal(listed.workspaceId, 'workspace-a');
+      assert.equal(listed.count, 1);
+      assert.equal(listed.accounts[0]!.accountId, 'CaseSensitive-OpenId');
+      assert.equal(listed.accounts[0]!.connectedAccountId, 'tiktok:CaseSensitive-OpenId');
+      assert.equal(listed.accounts[0]!.username, 'TOKEN=[REDACTED]');
+      assert.equal(listed.accounts[0]!.lastVerifiedAt, '2026-07-14T04:00:00.000Z');
+      const serialized = JSON.stringify(listed);
+      for (const canary of ['must-not-cross', 'provider-secret-must-not-cross', 'video.publish', 'providerPayload']) {
+        assert.equal(serialized.includes(canary), false, `${canary} must not cross the account-view allowlist`);
+      }
+    }
+    assert.equal(validated.ok, true);
+    if (validated.ok) {
+      assert.equal(validated.workspaceId, 'workspace-a');
+      assert.equal(validated.account.accountId, 'CaseSensitive-OpenId');
+    }
+  });
+
+  it('fails closed on malformed or non-exact connected-account success payloads', async () => {
+    const { fetchImpl } = makeFetch(() => ({
+      status: 200,
+      json: {
+        ok: true,
+        workspaceId: 'workspace-a',
+        account: { ...canonicalAccount, accountId: 'casesensitive-openid' },
+      },
+    }));
+    const port = makePort(fetchImpl);
+    const result = await port.validateConnectedAccount!({
+      userId: 'owner',
+      workspaceId: 'workspace-a',
+      provider: 'tiktok',
+      accountId: 'CaseSensitive-OpenId',
+    });
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.code, 'internal');
+  });
+
+  it('fails closed when success payloads do not prove exact workspace ownership and publishing readiness', async () => {
+    const payloads = [
+      {
+        ok: true,
+        workspaceId: 'workspace-other',
+        account: canonicalAccount,
+      },
+      {
+        ok: true,
+        workspaceId: 'workspace-a',
+        account: {
+          ...canonicalAccount,
+          publishingReady: false,
+          readinessBlockers: ['provider_not_active'],
+        },
+      },
+      {
+        ok: true,
+        workspaceId: 'workspace-a',
+        account: {
+          ...canonicalAccount,
+          connectionStatus: 'reauthorization_required',
+          publishingReady: false,
+          readinessBlockers: ['reauthorization_required'],
+        },
+      },
+    ];
+
+    for (const json of payloads) {
+      const { fetchImpl } = makeFetch(() => ({ status: 200, json }));
+      const port = makePort(fetchImpl);
+      const result = await port.validateConnectedAccount!({
+        userId: 'owner',
+        workspaceId: 'workspace-a',
+        provider: 'tiktok',
+        accountId: 'CaseSensitive-OpenId',
+      });
+      assert.equal(result.ok, false);
+      if (!result.ok) assert.equal(result.code, 'internal');
+    }
+
+    const { fetchImpl } = makeFetch(() => ({
+      status: 200,
+      json: { ok: true, workspaceId: 'workspace-other', count: 1, accounts: [canonicalAccount] },
+    }));
+    const listResult = await makePort(fetchImpl).listConnectedAccounts!({
+      userId: 'owner',
+      workspaceId: 'workspace-a',
+    });
+    assert.equal(listResult.ok, false);
+    if (!listResult.ok) assert.equal(listResult.code, 'internal');
+  });
+
+  it('preserves allowlisted account-domain reason codes and drops arbitrary error payloads', async () => {
+    const reasonCodes = [
+      'unknown_account_id',
+      'account_id_case_mismatch',
+      'account_id_non_canonical',
+      'account_workspace_mismatch',
+      'provider_account_mismatch',
+      'account_disconnected',
+      'account_not_publishing_ready',
+    ];
+    for (const reasonCode of reasonCodes) {
+      const { fetchImpl } = makeFetch(() => ({
+        status: reasonCode === 'unknown_account_id' ? 404 : 409,
+        json: {
+          ok: false,
+          code: reasonCode,
+          reason: `TOKEN=abc123DEF456ghi789JKL012mno345PQR Refused: ${reasonCode}`,
+          accountId: 'CaseSensitive-OpenId',
+          provider: 'tiktok',
+          blockers: ['account_disconnected'],
+          rawProviderPayload: { accessToken: 'must-not-cross' },
+        },
+      }));
+      const port = makePort(fetchImpl);
+      const result = await port.validateConnectedAccount!({
+        userId: 'owner',
+        workspaceId: 'workspace-a',
+        provider: 'tiktok',
+        accountId: 'CaseSensitive-OpenId',
+      });
+      assert.equal(result.ok, false);
+      if (!result.ok) {
+        assert.equal(result.reasonCode, reasonCode);
+        assert.equal(result.details?.reasonCode, reasonCode);
+        assert.equal(result.details?.accountId, 'CaseSensitive-OpenId');
+        assert.equal(result.message.includes('abc123DEF456ghi789JKL012mno345PQR'), false);
+        assert.equal(result.message.includes('TOKEN=[REDACTED]'), true);
+        assert.equal(JSON.stringify(result).includes('must-not-cross'), false);
+      }
+    }
+  });
+});
+
 describe('createAutoPosterHttpPort — status mapping', () => {
   const cases: Array<[number, string]> = [
     [401, 'unauthorized'],

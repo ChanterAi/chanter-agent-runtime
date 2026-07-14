@@ -39,8 +39,22 @@ export type AutoPosterPortErrorCode =
   | 'internal';
 
 /**
- * Safe commercial-decision facts returned by AutoPoster. These are
- * server-authoritative response fields, never caller-supplied plan claims.
+ * Safe, stable connected-account refusals emitted by AutoPoster. The HTTP
+ * port preserves these as `reasonCode`; the mission adapter maps them onto
+ * exact Runtime error codes without trusting arbitrary downstream strings.
+ */
+export type AutoPosterConnectedAccountReasonCode =
+  | 'unknown_account_id'
+  | 'account_id_case_mismatch'
+  | 'account_id_non_canonical'
+  | 'account_workspace_mismatch'
+  | 'provider_account_mismatch'
+  | 'account_disconnected'
+  | 'account_not_publishing_ready';
+
+/**
+ * Safe server-authoritative refusal facts returned by AutoPoster. The shape
+ * is a strict allowlist for commercial and connected-account decisions.
  */
 export interface AutoPosterCommercialDenialDetails {
   reasonCode?: string;
@@ -50,14 +64,67 @@ export interface AutoPosterCommercialDenialDetails {
   planId?: string;
   workspaceId?: string;
   evaluationTimestamp?: string;
+  accountId?: string;
+  provider?: string;
+  requestedProvider?: string;
+  accountProvider?: string;
+  blockers?: string[];
 }
 
 export interface AutoPosterPortFailure {
   ok: false;
   code: AutoPosterPortErrorCode;
   message: string;
-  /** Allowlisted entitlement/usage facts, when AutoPoster supplied them. */
+  /** Stable downstream domain code, when one survived the safe allowlist. */
+  reasonCode?: string;
+  /** Allowlisted refusal facts, when AutoPoster supplied them. */
   details?: AutoPosterCommercialDenialDetails;
+}
+
+/**
+ * Safe connected-account projection. Deliberately excludes owner ids,
+ * tokens, authorization scopes, provider payloads, and internal config.
+ */
+export interface AutoPosterConnectedAccountView {
+  provider: string;
+  providerDisplayName: string;
+  /** Exact canonical opaque provider id. Never case-normalized or trimmed. */
+  accountId: string;
+  /** Canonical provider/account composite (`provider:accountId`). */
+  connectedAccountId: string;
+  username: string;
+  displayName: string;
+  connectionStatus: 'connected' | 'reauthorization_required' | 'disconnected';
+  publishingReady: boolean;
+  readinessBlockers: string[];
+  lastVerifiedAt: string | null;
+}
+
+export interface AutoPosterConnectedAccountListParams {
+  userId: string;
+  workspaceId?: string;
+  provider?: string;
+}
+
+export interface AutoPosterConnectedAccountListSuccess {
+  ok: true;
+  workspaceId: string;
+  count: number;
+  accounts: AutoPosterConnectedAccountView[];
+}
+
+export interface AutoPosterConnectedAccountValidationParams {
+  userId: string;
+  workspaceId?: string;
+  provider: string;
+  /** Exact selected canonical id. Never case-normalized or trimmed. */
+  accountId: string;
+}
+
+export interface AutoPosterConnectedAccountValidationSuccess {
+  ok: true;
+  workspaceId: string;
+  account: AutoPosterConnectedAccountView;
 }
 
 /** Safe, normalized queue item view — never tokens, credentials, or raw provider payloads. */
@@ -173,6 +240,14 @@ export interface AutoPosterOperationsPort {
     params: AutoPosterMediaValidationParams
   ): Promise<AutoPosterMediaValidationSuccess | AutoPosterPortFailure>;
   schedulePost(params: AutoPosterScheduleParams): Promise<AutoPosterScheduleSuccess | AutoPosterPortFailure>;
+  /** Additive preflight capability; optional for legacy read/schedule-only ports. */
+  listConnectedAccounts?(
+    params: AutoPosterConnectedAccountListParams
+  ): Promise<AutoPosterConnectedAccountListSuccess | AutoPosterPortFailure>;
+  /** Additive preflight capability; optional for legacy read/schedule-only ports. */
+  validateConnectedAccount?(
+    params: AutoPosterConnectedAccountValidationParams
+  ): Promise<AutoPosterConnectedAccountValidationSuccess | AutoPosterPortFailure>;
 }
 
 // ---------------------------------------------------------------------------
@@ -188,6 +263,58 @@ export const AUTOPOSTER_ACTIONS = {
 
 const QUEUE_LIST_MAX_LIMIT = 100;
 const QUEUE_LIST_DEFAULT_LIMIT = 25;
+
+function canonicalScheduleProviderScope(value: JsonValue | undefined): string {
+  return value === undefined ? 'tiktok' : typeof value === 'string' ? value : '';
+}
+
+function validateScheduleIdempotencyScope(request: RuntimeMissionRequest): RuntimeMissionError[] {
+  const errors: RuntimeMissionError[] = [];
+  if (request.action !== AUTOPOSTER_ACTIONS.postSchedule) {
+    errors.push({
+      code: 'ACTION_SCOPE_MISMATCH',
+      message: `Replay scope requires the exact action "${AUTOPOSTER_ACTIONS.postSchedule}".`,
+    });
+  }
+
+  const workspaceId = request.tenant.workspaceId;
+  if (
+    workspaceId !== undefined
+    && (typeof workspaceId !== 'string' || !workspaceId || workspaceId !== workspaceId.trim())
+  ) {
+    errors.push({
+      code: 'WORKSPACE_SCOPE_MISMATCH',
+      message: 'tenant.workspaceId must be a nonblank canonical workspace id with no surrounding whitespace.',
+    });
+  }
+
+  const provider = request.input.provider;
+  if (provider !== undefined && provider !== 'tiktok' && provider !== 'youtube') {
+    errors.push({
+      code: 'PROVIDER_SCOPE_MISMATCH',
+      message: 'input.provider must be the exact canonical provider id "tiktok" or "youtube".',
+    });
+  }
+
+  const inputAccountId = typeof request.input.accountId === 'string' ? request.input.accountId : '';
+  const tenantAccountId = typeof request.tenant.accountId === 'string' ? request.tenant.accountId : '';
+  if (!inputAccountId.trim() || !tenantAccountId.trim()) {
+    errors.push({
+      code: 'MISSING_ACCOUNT_ID',
+      message: 'Both input.accountId and tenant.accountId are required and must be nonblank for scheduling.',
+    });
+  } else if (
+    inputAccountId !== tenantAccountId
+    || inputAccountId !== inputAccountId.trim()
+    || tenantAccountId !== tenantAccountId.trim()
+  ) {
+    errors.push({
+      code: 'ACCOUNT_SCOPE_MISMATCH',
+      message: 'input.accountId and tenant.accountId must be the same exact canonical opaque account id.',
+    });
+  }
+  return errors;
+}
 
 const ACTION_SPECS: RuntimeMissionActionSpec[] = [
   {
@@ -222,6 +349,8 @@ const ACTION_SPECS: RuntimeMissionActionSpec[] = [
     riskLevel: 'high',
     executionPolicy: 'requires_approval',
     requiresIdempotencyKey: true,
+    validateIdempotencyScope: validateScheduleIdempotencyScope,
+    resolveIdempotencyScope: (request) => `provider:${canonicalScheduleProviderScope(request.input.provider)}`,
   },
 ];
 
@@ -237,6 +366,16 @@ function validationFailure(errors: RuntimeMissionError[]): RuntimeMissionAdapter
   return { ok: false, status: 'validation_failed', errors };
 }
 
+const ACCOUNT_REASON_TO_RUNTIME_ERROR: Readonly<Record<string, string>> = {
+  unknown_account_id: 'AUTOPOSTER_UNKNOWN_ACCOUNT_ID',
+  account_id_case_mismatch: 'AUTOPOSTER_ACCOUNT_ID_CASE_MISMATCH',
+  account_id_non_canonical: 'AUTOPOSTER_ACCOUNT_ID_NON_CANONICAL',
+  account_workspace_mismatch: 'AUTOPOSTER_ACCOUNT_WORKSPACE_MISMATCH',
+  provider_account_mismatch: 'AUTOPOSTER_PROVIDER_ACCOUNT_MISMATCH',
+  account_disconnected: 'AUTOPOSTER_ACCOUNT_DISCONNECTED',
+  account_not_publishing_ready: 'AUTOPOSTER_ACCOUNT_NOT_PUBLISHING_READY',
+};
+
 function portFailureOutcome(action: string, failure: AutoPosterPortFailure): RuntimeMissionAdapterOutcome {
   const status: RuntimeMissionAdapterOutcome['status'] =
     failure.code === 'unavailable'
@@ -250,7 +389,13 @@ function portFailureOutcome(action: string, failure: AutoPosterPortFailure): Run
     ok: false,
     status,
     ...(failure.details ? { output: { ...failure.details } as JsonValue } : {}),
-    errors: [{ code: `AUTOPOSTER_${failure.code.toUpperCase()}`, message: failure.message }],
+    errors: [{
+      code:
+        (failure.reasonCode && ACCOUNT_REASON_TO_RUNTIME_ERROR[failure.reasonCode])
+        || (failure.details?.reasonCode && ACCOUNT_REASON_TO_RUNTIME_ERROR[failure.details.reasonCode])
+        || `AUTOPOSTER_${failure.code.toUpperCase()}`,
+      message: failure.message,
+    }],
     evidence: [
       {
         type: 'note',
@@ -435,9 +580,12 @@ export function createAutoPosterMissionAdapter(port: AutoPosterOperationsPort): 
   }
 
   async function executePostSchedule(request: RuntimeMissionRequest): Promise<RuntimeMissionAdapterOutcome> {
-    const errors: RuntimeMissionError[] = [];
-    const accountId = asTrimmedString(request.input.accountId) || request.tenant.accountId?.trim() || '';
-    const workspaceId = request.tenant.workspaceId?.trim() || '';
+    const errors = validateScheduleIdempotencyScope(request);
+    const tenantAccountId = typeof request.tenant.accountId === 'string' ? request.tenant.accountId : '';
+    // Preserve the selected opaque id byte-for-byte. Whitespace/case
+    // normalization here could silently redirect a mission to another id.
+    const accountId = tenantAccountId;
+    const workspaceId = typeof request.tenant.workspaceId === 'string' ? request.tenant.workspaceId : '';
     const mediaUrl = asTrimmedString(request.input.mediaUrl);
     const scheduledAtRaw = asTrimmedString(request.input.scheduledAt);
     const caption = asTrimmedString(request.input.caption);
@@ -445,11 +593,10 @@ export function createAutoPosterMissionAdapter(port: AutoPosterOperationsPort): 
     // Optional provider selection (Part 3: YouTube). AutoPoster remains the
     // authority; this only rejects the one KNOWN-missing field early so a
     // mission gets a precise error instead of a downstream refusal.
-    const provider = asTrimmedString(request.input.provider).toLowerCase();
+    const provider = typeof request.input.provider === 'string' ? request.input.provider : '';
     const title = asTrimmedString(request.input.title);
     const description = asTrimmedString(request.input.description);
 
-    if (!accountId) errors.push({ code: 'MISSING_ACCOUNT_ID', message: 'accountId is required for scheduling.' });
     if (!mediaUrl) errors.push({ code: 'MISSING_MEDIA_URL', message: 'mediaUrl is required for scheduling.' });
     if (provider === 'youtube' && !title) {
       errors.push({ code: 'MISSING_YOUTUBE_TITLE', message: 'title is required when provider is youtube.' });
@@ -493,11 +640,11 @@ export function createAutoPosterMissionAdapter(port: AutoPosterOperationsPort): 
     }
 
     const post = result.post as AutoPosterScheduleSuccess['post'] | undefined;
-    const postId = typeof post?.id === 'string' ? post.id.trim() : '';
-    if (!post || !postId) {
+    const postId = typeof post?.id === 'string' ? post.id : '';
+    if (!post || !postId || postId !== postId.trim()) {
       return invalidScheduleResponseOutcome(
         'AUTOPOSTER_INVALID_SCHEDULE_RESPONSE',
-        'AutoPoster returned a schedule response without a valid post.id.'
+        'AutoPoster returned a schedule response without an exact canonical post.id.'
       );
     }
     if (post.approved !== false) {
@@ -506,7 +653,7 @@ export function createAutoPosterMissionAdapter(port: AutoPosterOperationsPort): 
         'AutoPoster did not confirm that the scheduled queue draft is unapproved.'
       );
     }
-    const postAccountId = typeof post.accountId === 'string' ? post.accountId.trim() : '';
+    const postAccountId = typeof post.accountId === 'string' ? post.accountId : '';
     const expectedProvider = provider || 'tiktok';
     const postProvider =
       typeof post.provider === 'string'

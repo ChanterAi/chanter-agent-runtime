@@ -43,7 +43,7 @@ Layer responsibilities are fixed:
 
 `RuntimeMissionRequest` (src/missions.ts): `missionId`, `traceId` (defaults to
 `missionId`; preserved through the full chain), `product`, `action`, `actor {id, kind}`,
-`tenant {userId, accountId?}`, `input`, `policyContext?`, `approval {approved,
+`tenant {userId, workspaceId?, accountId?}`, `input`, `policyContext?`, `approval {approved,
 approvedBy, note}?`, `idempotencyKey?`, `metadata?`, `requestedAt?`.
 
 `RuntimeMissionResult`: `missionId`, `traceId`, `product`, `action`, `status`, `output`,
@@ -64,7 +64,17 @@ an empty success. `media.validate` succeeds as a *validation run* — an invalid
   refused with 503 (fail closed). Admin session cookies are never accepted there.
 - Tenant identity is derived server-side from the token (AutoPoster's
   `config.defaultUserId`); a caller-supplied userId is ignored. Account scope is
-  verified against `storage.getTikTokAccount` ownership.
+  verified against AutoPoster's canonical TikTok/YouTube account registry and
+  server-authoritative workspace scope.
+- Scheduling requires the same nonblank opaque account ID in both
+  `tenant.accountId` and `input.accountId`; Runtime compares them byte-for-byte and
+  refuses the mission before the operations port when either scope is absent or they
+  differ.
+- The HTTP operations port exposes read-only connected-account listing and exact
+  account preflight in addition to the four mission actions. These helpers preserve
+  opaque account ID bytes, accept only allowlisted account fields, and map stable
+  account/workspace/provider/readiness refusals without exposing credentials or raw
+  provider payloads.
 - Redaction is applied at the runtime's existing choke points (task inputs, events,
   evidence exports) plus mission outputs/warnings/errors in `executeMission`. The
   service token is sent only in the `x-chanter-runtime-token` header and never logged
@@ -89,15 +99,20 @@ only path to publishing.
 
 Two layers, both test-proven:
 
-1. **Runtime** (`createInMemoryIdempotencyStore`, per MCP server process): a key that
-   already reached the adapter returns the stored result as `status: duplicate` with
-   `idempotency.outcome: duplicate` and the original missionId. Missions refused before
-   execution (validation/approval/policy) do not consume their key, so a corrected
-   retry works.
+1. **Runtime** (`createInMemoryIdempotencyStore`, per process): the store key includes
+   product, action, tenant user, workspace, exact opaque account ID, canonical provider
+   scope, and caller key. For scheduling, an omitted provider canonically scopes to
+   TikTok, so a matching raw account ID and caller key cannot replay across TikTok and
+   YouTube.
+   A key that already reached the adapter returns the stored result as
+   `status: duplicate` with `idempotency.outcome: duplicate` and the original missionId.
+   Concurrent same-process calls share one in-flight execution. Missions refused before
+   execution (validation/approval/policy), and typed downstream failures, do not consume
+   their key, so only an explicit corrected retry can run again.
 2. **AutoPoster** (durable, in the queue itself): each runtime-scheduled post stores
-   `runtimeIdempotencyKey`; the schedule route returns the existing item
-   (`duplicate: true`) instead of creating a second one. This holds even across MCP
-   server restarts.
+   `runtimeIdempotencyKey` and uses a deterministic create-only document ID. The
+   schedule route returns the existing item (`duplicate: true`) instead of creating a
+   second one. This holds across Runtime process restarts and concurrent instances.
 
 ## 7. Supported and intentionally unsupported
 
@@ -115,11 +130,11 @@ and no fake execution-preview layer was invented on top of it.
 Run the proofs:
 
 ```bash
-# runtime: mission executor + adapter + HTTP port (187 tests)
+# runtime: mission executor + adapter + HTTP port
 cd apps/chanter-agent-runtime && npm run build && npm test
-# AutoPoster: control routes (152 tests)
+# AutoPoster: application service + control routes + safety gates
 cd apps/chanter-auto-poster && npm test
-# MCP: tools + end-to-end success/failure contract (178 tests)
+# MCP: tools + end-to-end success/failure contract
 cd apps/chanter-mcp-server && npm test
 ```
 
@@ -151,10 +166,9 @@ evidence bundle with the full event log.
 
 ## 9. Known limitations
 
-- The runtime idempotency store is in-memory per MCP process; durable idempotency is
-  provided only by AutoPoster's `runtimeIdempotencyKey` lookup, which is a
-  read-then-write (a concurrent same-key race could pass the read; the runtime layer
-  narrows but does not eliminate this).
+- The runtime idempotency store and in-flight coalescing are process-local. Durable
+  cross-process duplicate prevention is owned by AutoPoster's deterministic queue
+  document identity, not by Runtime memory.
 - Single-tenant: tenant identity is AutoPoster's `defaultUserId`; multi-user auth does
   not exist yet anywhere in AutoPoster.
 - Live-chain verification (real MCP process against a real AutoPoster server) requires

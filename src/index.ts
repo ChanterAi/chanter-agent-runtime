@@ -115,7 +115,14 @@ export {
 // ── AutoPoster mission adapter + operations port ──
 export type {
   AutoPosterPortErrorCode,
+  AutoPosterConnectedAccountReasonCode,
+  AutoPosterCommercialDenialDetails,
   AutoPosterPortFailure,
+  AutoPosterConnectedAccountView,
+  AutoPosterConnectedAccountListParams,
+  AutoPosterConnectedAccountListSuccess,
+  AutoPosterConnectedAccountValidationParams,
+  AutoPosterConnectedAccountValidationSuccess,
   AutoPosterQueueItemView,
   AutoPosterQueueListSuccess,
   AutoPosterPostStatusView,
