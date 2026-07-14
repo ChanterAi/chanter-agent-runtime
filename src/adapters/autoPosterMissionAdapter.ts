@@ -24,6 +24,7 @@ import type {
   RuntimeMissionError,
   RuntimeMissionRequest,
 } from '../missions.js';
+import { createRuntimeMissionPayloadHash } from '../missions.js';
 
 // ---------------------------------------------------------------------------
 // Operations port contract
@@ -184,6 +185,40 @@ export interface AutoPosterScheduleSuccess {
   };
 }
 
+export type AutoPosterScheduleReconciliationOutcome =
+  | 'not_found'
+  | 'unique'
+  | 'conflict'
+  | 'scope_mismatch'
+  | 'idempotency_mismatch'
+  | 'payload_mismatch';
+
+export interface AutoPosterScheduleReconciliationSuccess {
+  ok: true;
+  outcome: AutoPosterScheduleReconciliationOutcome;
+  count: number;
+  unique: boolean;
+  safeToReuse: boolean;
+  approvalState: 'not_started' | 'required' | 'approved' | 'unknown';
+  publishingState:
+    | 'not_started'
+    | 'blocked_until_human_approval'
+    | 'processing'
+    | 'posted'
+    | 'failed'
+    | 'unknown';
+  evidenceStatus:
+    | 'not_found'
+    | 'authoritative'
+    | 'conflict'
+    | 'invalid'
+    | 'scope_mismatch'
+    | 'idempotency_mismatch'
+    | 'payload_mismatch';
+  post?: AutoPosterScheduleSuccess['post'];
+  conflictingPostIds?: string[];
+}
+
 export interface AutoPosterQueueListParams {
   userId: string;
   workspaceId?: string;
@@ -226,6 +261,22 @@ export interface AutoPosterScheduleParams {
   traceId?: string;
   idempotencyKey: string;
   requestedBy: string;
+  missionId?: string;
+  action?: typeof AUTOPOSTER_ACTIONS.postSchedule;
+  missionPayloadHash?: string;
+}
+
+export interface AutoPosterScheduleReconciliationParams {
+  userId: string;
+  workspaceId: string;
+  accountId: string;
+  provider: 'tiktok' | 'youtube';
+  scheduledAt: string;
+  idempotencyKey: string;
+  missionId: string;
+  action: typeof AUTOPOSTER_ACTIONS.postSchedule;
+  missionPayloadHash: string;
+  traceId?: string;
 }
 
 /**
@@ -240,6 +291,10 @@ export interface AutoPosterOperationsPort {
     params: AutoPosterMediaValidationParams
   ): Promise<AutoPosterMediaValidationSuccess | AutoPosterPortFailure>;
   schedulePost(params: AutoPosterScheduleParams): Promise<AutoPosterScheduleSuccess | AutoPosterPortFailure>;
+  /** Exact, read-only durable lookup used after an uncertain schedule boundary. */
+  reconcileSchedule?(
+    params: AutoPosterScheduleReconciliationParams
+  ): Promise<AutoPosterScheduleReconciliationSuccess | AutoPosterPortFailure>;
   /** Additive preflight capability; optional for legacy read/schedule-only ports. */
   listConnectedAccounts?(
     params: AutoPosterConnectedAccountListParams
@@ -351,6 +406,8 @@ const ACTION_SPECS: RuntimeMissionActionSpec[] = [
     requiresIdempotencyKey: true,
     validateIdempotencyScope: validateScheduleIdempotencyScope,
     resolveIdempotencyScope: (request) => `provider:${canonicalScheduleProviderScope(request.input.provider)}`,
+    resolveReplayProvider: (request) => canonicalScheduleProviderScope(request.input.provider),
+    downstreamOperationType: 'autoposter.queue.create_unapproved_draft',
   },
 ];
 
@@ -628,8 +685,11 @@ export function createAutoPosterMissionAdapter(port: AutoPosterOperationsPort): 
       scheduledAt: scheduledAtIso,
       traceId: request.traceId?.trim() || request.missionId,
       // executeMission guarantees this is present for requiresIdempotencyKey actions.
-      idempotencyKey: request.idempotencyKey!.trim(),
+      idempotencyKey: request.idempotencyKey!,
       requestedBy: request.actor.id,
+      missionId: request.missionId,
+      action: AUTOPOSTER_ACTIONS.postSchedule,
+      missionPayloadHash: createRuntimeMissionPayloadHash(request),
     });
     if (!result.ok) return portFailureOutcome(AUTOPOSTER_ACTIONS.postSchedule, result);
     if (typeof result.duplicate !== 'boolean') {
@@ -655,20 +715,19 @@ export function createAutoPosterMissionAdapter(port: AutoPosterOperationsPort): 
     }
     const postAccountId = typeof post.accountId === 'string' ? post.accountId : '';
     const expectedProvider = provider || 'tiktok';
-    const postProvider =
-      typeof post.provider === 'string'
-        ? post.provider.trim().toLowerCase()
-        : provider
-          ? ''
-          : 'tiktok';
-    const postStatus = typeof post.status === 'string' ? post.status.trim() : '';
-    const postScheduledAt = typeof post.scheduledAt === 'string' ? post.scheduledAt.trim() : '';
+    const postProvider = typeof post.provider === 'string'
+      ? post.provider
+      : provider
+        ? ''
+        : 'tiktok';
+    const postStatus = typeof post.status === 'string' ? post.status : '';
+    const postScheduledAt = typeof post.scheduledAt === 'string' ? post.scheduledAt : '';
     if (
       postAccountId !== accountId ||
       postProvider !== expectedProvider ||
       postStatus !== 'scheduled' ||
       !postScheduledAt ||
-      Date.parse(postScheduledAt) !== Date.parse(scheduledAtIso)
+      postScheduledAt !== scheduledAtIso
     ) {
       return invalidScheduleResponseOutcome(
         'AUTOPOSTER_UNSAFE_SCHEDULE_RESPONSE',

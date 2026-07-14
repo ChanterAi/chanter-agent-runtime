@@ -8,6 +8,7 @@ import { describe, it } from 'node:test';
 import {
   createInMemoryIdempotencyStore,
   createMissionAdapterRegistry,
+  createRuntimeMissionPayloadHash,
   executeMission,
   type RuntimeMissionAdapter,
   type RuntimeMissionRequest,
@@ -60,6 +61,46 @@ function makeRequest(overrides: Partial<RuntimeMissionRequest> = {}): RuntimeMis
     ...overrides,
   };
 }
+
+describe('runtime mission payload hash', () => {
+  it('is stable across object key order and excludes process-local request metadata', () => {
+    const first = makeRequest({
+      missionId: 'mission-a',
+      traceId: 'trace-a',
+      tenant: { userId: 'owner', workspaceId: 'workspace-a', accountId: 'Case-A' },
+      input: { caption: 'hello', nested: { beta: 2, alpha: 1 } },
+      requestedAt: '2026-07-14T00:00:00.000Z',
+    });
+    const second = makeRequest({
+      missionId: 'mission-b',
+      traceId: 'trace-b',
+      tenant: { userId: 'owner', workspaceId: 'workspace-a', accountId: 'Case-A' },
+      input: { nested: { alpha: 1, beta: 2 }, caption: 'hello' },
+      requestedAt: '2026-07-15T00:00:00.000Z',
+    });
+    assert.equal(createRuntimeMissionPayloadHash(first), createRuntimeMissionPayloadHash(second));
+  });
+
+  it('changes for every exact action, workspace, account case/whitespace, provider, or payload mutation', () => {
+    const base = makeRequest({
+      action: 'autoposter.post.schedule',
+      tenant: { userId: 'owner', workspaceId: 'workspace-a', accountId: 'Case-A' },
+      input: { provider: 'tiktok', accountId: 'Case-A', caption: 'hello' },
+    });
+    const baseline = createRuntimeMissionPayloadHash(base);
+    const mutations: RuntimeMissionRequest[] = [
+      { ...base, action: 'autoposter.queue.list' },
+      { ...base, tenant: { ...base.tenant, workspaceId: 'workspace-b' } },
+      { ...base, tenant: { ...base.tenant, accountId: 'case-a' } },
+      { ...base, tenant: { ...base.tenant, accountId: ' Case-A' } },
+      { ...base, input: { ...base.input, provider: 'youtube' } },
+      { ...base, input: { ...base.input, caption: 'changed' } },
+    ];
+    for (const mutation of mutations) {
+      assert.notEqual(createRuntimeMissionPayloadHash(mutation), baseline);
+    }
+  });
+});
 
 describe('executeMission — dispatch and routing', () => {
   it('dispatches a supported action to the adapter and succeeds', async () => {
@@ -199,7 +240,7 @@ describe('executeMission — approval gate', () => {
 });
 
 describe('executeMission — idempotency', () => {
-  it('a duplicate idempotency key does not execute twice and reports the original mission', async () => {
+  it('an exact mission replay does not execute twice and reports the authoritative mission', async () => {
     const { adapter, calls } = makeAdapter();
     const registry = createMissionAdapterRegistry([adapter]);
     const store = createInMemoryIdempotencyStore();
@@ -213,7 +254,7 @@ describe('executeMission — idempotency', () => {
       registry,
       idempotencyStore: store,
     });
-    const second = await executeMission(makeRequest({ ...base, missionId: 'mission-b' }), {
+    const second = await executeMission(makeRequest({ ...base, missionId: 'mission-a' }), {
       registry,
       idempotencyStore: store,
     });
@@ -253,7 +294,7 @@ describe('executeMission — idempotency', () => {
       { registry, idempotencyStore: store }
     );
     const replayA = await executeMission(
-      makeRequest({ ...write, missionId: 'mission-a-replay', tenant: { userId: 'owner', workspaceId: 'workspace-a' } }),
+      makeRequest({ ...write, missionId: 'mission-a', tenant: { userId: 'owner', workspaceId: 'workspace-a' } }),
       { registry, idempotencyStore: store }
     );
 
@@ -309,7 +350,7 @@ describe('executeMission — idempotency', () => {
     );
     const replayA = await executeMission(
       makeRequest({
-        missionId: 'mission-write-a-replay',
+        missionId: 'mission-write-a',
         action: 'test.write',
         tenant: tenantA,
         idempotencyKey: 'shared-key',
@@ -409,7 +450,7 @@ describe('executeMission — idempotency', () => {
 
     const [first, replay] = await Promise.all([
       executeMission(makeRequest({ ...base, missionId: 'mission-concurrent-a' }), { registry, idempotencyStore: store }),
-      executeMission(makeRequest({ ...base, missionId: 'mission-concurrent-b' }), { registry, idempotencyStore: store }),
+      executeMission(makeRequest({ ...base, missionId: 'mission-concurrent-a' }), { registry, idempotencyStore: store }),
     ]);
 
     assert.equal(first.status, 'succeeded');
@@ -444,7 +485,7 @@ describe('executeMission — idempotency', () => {
 
     const [first, replay] = await Promise.all([
       executeMission(makeRequest({ ...base, missionId: 'mission-denial-a' }), { registry, idempotencyStore: store }),
-      executeMission(makeRequest({ ...base, missionId: 'mission-denial-b' }), { registry, idempotencyStore: store }),
+      executeMission(makeRequest({ ...base, missionId: 'mission-denial-a' }), { registry, idempotencyStore: store }),
     ]);
     assert.equal(first.status, 'denied');
     assert.equal(replay.status, 'denied');
@@ -452,13 +493,115 @@ describe('executeMission — idempotency', () => {
     assert.equal(replay.idempotency.outcome, 'duplicate');
     assert.equal(attempts, 1, 'the concurrent request shares the refusal instead of retrying');
 
-    const manualRetry = await executeMission(makeRequest({ ...base, missionId: 'mission-denial-retry' }), {
+    const manualRetry = await executeMission(makeRequest({ ...base, missionId: 'mission-denial-a' }), {
       registry,
       idempotencyStore: store,
     });
     assert.equal(manualRetry.status, 'denied');
     assert.equal(manualRetry.idempotency.outcome, 'first_execution');
     assert.equal(attempts, 2, 'a later explicit retry remains possible because failures are not cached');
+  });
+
+  it('rejects every independent replay-binding mutation without prior output or evidence', async () => {
+    const baseline = makeRequest({
+      missionId: 'mission-exact-binding',
+      action: 'test.write',
+      tenant: {
+        userId: 'owner',
+        workspaceId: 'workspace-a',
+        accountId: 'CaseSensitive-Account',
+      },
+      input: {
+        provider: 'tiktok',
+        caption: 'baseline',
+        scheduledAt: '2026-07-20T12:00:00.000Z',
+      },
+      idempotencyKey: 'Raw-Key-A',
+      approval: { approved: true, approvedBy: 'founder' },
+    });
+    const mutations: Array<{
+      label: string;
+      request: RuntimeMissionRequest;
+      code: string;
+    }> = [
+      { label: 'action', request: { ...baseline, action: 'test.read' }, code: 'RUNTIME_REPLAY_SCOPE_MISMATCH' },
+      { label: 'workspace', request: { ...baseline, tenant: { ...baseline.tenant, workspaceId: 'workspace-b' } }, code: 'RUNTIME_REPLAY_SCOPE_MISMATCH' },
+      { label: 'provider', request: { ...baseline, input: { ...baseline.input, provider: 'youtube' } }, code: 'RUNTIME_REPLAY_SCOPE_MISMATCH' },
+      { label: 'account-value', request: { ...baseline, tenant: { ...baseline.tenant, accountId: 'Other-Account' } }, code: 'RUNTIME_REPLAY_SCOPE_MISMATCH' },
+      { label: 'account-case', request: { ...baseline, tenant: { ...baseline.tenant, accountId: 'casesensitive-account' } }, code: 'RUNTIME_REPLAY_SCOPE_MISMATCH' },
+      { label: 'account-whitespace', request: { ...baseline, tenant: { ...baseline.tenant, accountId: ' CaseSensitive-Account' } }, code: 'RUNTIME_REPLAY_SCOPE_MISMATCH' },
+      { label: 'payload', request: { ...baseline, input: { ...baseline.input, caption: 'changed' } }, code: 'RUNTIME_PAYLOAD_MISMATCH' },
+      { label: 'idempotency-key', request: { ...baseline, idempotencyKey: 'Raw-Key-B' }, code: 'RUNTIME_IDEMPOTENCY_MISMATCH' },
+      { label: 'schedule', request: { ...baseline, input: { ...baseline.input, scheduledAt: '2026-07-20T12:00:00Z' } }, code: 'RUNTIME_PAYLOAD_MISMATCH' },
+    ];
+
+    for (const mutation of mutations) {
+      const { adapter, calls } = makeAdapter();
+      const registry = createMissionAdapterRegistry([adapter]);
+      const store = createInMemoryIdempotencyStore();
+      const first = await executeMission(baseline, { registry, idempotencyStore: store });
+      const rejected = await executeMission(mutation.request, { registry, idempotencyStore: store });
+      assert.equal(first.status, 'succeeded', mutation.label);
+      assert.equal(rejected.status, 'validation_failed', mutation.label);
+      assert.equal(rejected.errors[0]?.code, mutation.code, mutation.label);
+      assert.equal(rejected.output, null, mutation.label);
+      assert.equal(rejected.evidence, null, mutation.label);
+      assert.equal(rejected.idempotency.outcome, 'mismatch', mutation.label);
+      assert.equal(calls.length, 1, `${mutation.label}: mutation must create no downstream job`);
+    }
+  });
+
+  it('places Runtime failure hooks on opposite sides of exact result persistence', async () => {
+    let attempts = 0;
+    const { adapter } = makeAdapter({
+      async execute() {
+        attempts += 1;
+        return {
+          ok: true,
+          output: { post: { id: 'queue-exact-1' } },
+        };
+      },
+    });
+    const registry = createMissionAdapterRegistry([adapter]);
+    const request = makeRequest({
+      missionId: 'mission-runtime-boundaries',
+      action: 'test.write',
+      idempotencyKey: 'boundary-key',
+      approval: { approved: true, approvedBy: 'founder' },
+    });
+
+    const beforeStore = createInMemoryIdempotencyStore();
+    await assert.rejects(
+      executeMission(request, {
+        registry,
+        idempotencyStore: beforeStore,
+        failureInjector(boundary) {
+          if (boundary === 'after_runtime_receives_queue_id_before_result_persistence') {
+            throw new Error('injected-before-runtime-result-persistence');
+          }
+        },
+      }),
+      /injected-before-runtime-result-persistence/
+    );
+    assert.equal(beforeStore.getByMissionId(request.missionId), undefined);
+
+    const afterStore = createInMemoryIdempotencyStore();
+    await assert.rejects(
+      executeMission(request, {
+        registry,
+        idempotencyStore: afterStore,
+        failureInjector(boundary) {
+          if (boundary === 'after_runtime_result_persistence') {
+            throw new Error('injected-after-runtime-result-persistence');
+          }
+        },
+      }),
+      /injected-after-runtime-result-persistence/
+    );
+    assert.ok(afterStore.getByMissionId(request.missionId));
+    const replay = await executeMission(request, { registry, idempotencyStore: afterStore });
+    assert.equal(replay.status, 'duplicate');
+    assert.equal(attempts, 2, 'the persisted result suppresses a third adapter execution');
   });
 });
 

@@ -108,6 +108,115 @@ describe('createAutoPosterHttpPort — wiring', () => {
   });
 });
 
+describe('createAutoPosterHttpPort - durable schedule reconciliation', () => {
+  const params = {
+    userId: 'owner',
+    workspaceId: 'workspace-a',
+    accountId: 'Case-A',
+    provider: 'tiktok' as const,
+    scheduledAt: '2030-07-15T15:50:00.000Z',
+    idempotencyKey: 'idem-a',
+    missionId: 'mission-a',
+    action: 'autoposter.post.schedule' as const,
+    missionPayloadHash: 'a'.repeat(64),
+    traceId: 'trace-a',
+  };
+
+  it('preserves exact scope and accepts one authoritative reusable result', async () => {
+    const { fetchImpl, calls } = makeFetch(() => ({
+      status: 200,
+      json: {
+        ok: true,
+        outcome: 'unique',
+        count: 1,
+        unique: true,
+        safeToReuse: true,
+        approvalState: 'required',
+        publishingState: 'blocked_until_human_approval',
+        evidenceStatus: 'authoritative',
+        post: {
+          id: 'Queue-Exact/01',
+          accountId: 'Case-A',
+          provider: 'tiktok',
+          status: 'scheduled',
+          scheduledAt: params.scheduledAt,
+          approved: false,
+        },
+      },
+    }));
+    const result = await makePort(fetchImpl).reconcileSchedule!(params);
+    assert.equal(result.ok, true);
+    assert.equal(result.ok && result.outcome, 'unique');
+    assert.equal(calls[0]!.url, 'http://localhost:3010/api/runtime/schedule/reconcile');
+    assert.equal(calls[0]!.headers['x-correlation-id'], 'trace-a');
+    assert.deepEqual(JSON.parse(calls[0]!.body!), {
+      workspaceId: 'workspace-a',
+      accountId: 'Case-A',
+      provider: 'tiktok',
+      scheduledAt: params.scheduledAt,
+      idempotencyKey: 'idem-a',
+      missionId: 'mission-a',
+      action: 'autoposter.post.schedule',
+      missionPayloadHash: 'a'.repeat(64),
+    });
+  });
+
+  it('accepts explicit not-found, mismatch, and conflict truth without exposing unsafe evidence', async () => {
+    const payloads = [
+      {
+        ok: true, outcome: 'not_found', count: 0, unique: true, safeToReuse: false,
+        approvalState: 'not_started', publishingState: 'not_started', evidenceStatus: 'not_found',
+      },
+      {
+        ok: true, outcome: 'conflict', count: 2, unique: false, safeToReuse: false,
+        approvalState: 'unknown', publishingState: 'unknown', evidenceStatus: 'conflict',
+        conflictingPostIds: ['conflict-A', 'conflict-B'],
+      },
+      ...(['scope_mismatch', 'idempotency_mismatch', 'payload_mismatch'] as const).map((outcome) => ({
+        ok: true,
+        outcome,
+        count: 1,
+        unique: true,
+        safeToReuse: false,
+        approvalState: 'unknown',
+        publishingState: 'not_started',
+        evidenceStatus: outcome,
+      })),
+    ];
+    for (const payload of payloads) {
+      const { fetchImpl } = makeFetch(() => ({ status: 200, json: payload }));
+      const result = await makePort(fetchImpl).reconcileSchedule!(params);
+      assert.equal(result.ok, true);
+      assert.equal(result.ok && result.outcome, payload.outcome);
+    }
+  });
+
+  it('rejects contradictory, mismatched, or unsafe success evidence', async () => {
+    const invalidPayloads = [
+      {
+        ok: true, outcome: 'not_found', count: 1, unique: true, safeToReuse: false,
+        approvalState: 'not_started', publishingState: 'not_started', evidenceStatus: 'not_found',
+      },
+      {
+        ok: true, outcome: 'conflict', count: 2, unique: false, safeToReuse: false,
+        approvalState: 'unknown', publishingState: 'unknown', evidenceStatus: 'conflict',
+        conflictingPostIds: ['only-one'],
+      },
+      {
+        ok: true, outcome: 'unique', count: 1, unique: true, safeToReuse: true,
+        approvalState: 'required', publishingState: 'blocked_until_human_approval', evidenceStatus: 'authoritative',
+        post: { id: 'queue-a', accountId: 'case-a', provider: 'tiktok', status: 'scheduled', scheduledAt: params.scheduledAt, approved: false },
+      },
+    ];
+    for (const payload of invalidPayloads) {
+      const { fetchImpl } = makeFetch(() => ({ status: 200, json: payload }));
+      const result = await makePort(fetchImpl).reconcileSchedule!(params);
+      assert.equal(result.ok, false);
+      assert.equal(!result.ok && result.code, 'internal');
+    }
+  });
+});
+
 describe('createAutoPosterHttpPort — safe connected-account preflight', () => {
   const canonicalAccount = {
     provider: 'tiktok',

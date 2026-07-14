@@ -20,6 +20,7 @@
  *  - all outputs, errors, and evidence pass through the runtime's redaction
  *    choke points before leaving this module.
  */
+import { createHash } from 'node:crypto';
 import type { JsonValue, RuntimeProduct, RuntimeRiskLevel, RuntimeExecutionPolicy } from './types.js';
 import {
   approveTask,
@@ -90,6 +91,35 @@ export interface RuntimeMissionRequest {
   requestedAt?: string;
 }
 
+function canonicalJson(value: JsonValue): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  const entries = Object.entries(value)
+    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+    .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`);
+  return `{${entries.join(',')}}`;
+}
+
+/**
+ * Stable SHA-256 binding for the execution payload and exact tenant scope.
+ * Object key order is normalized; opaque workspace/account identifiers are
+ * deliberately preserved byte-for-byte.
+ */
+export function createRuntimeMissionPayloadHash(request: RuntimeMissionRequest): string {
+  const payload: JsonValue = {
+    version: 'runtime-mission-payload-v1',
+    product: request.product,
+    action: request.action,
+    tenant: {
+      userId: request.tenant.userId.trim(),
+      workspaceId: request.tenant.workspaceId ?? null,
+      accountId: request.tenant.accountId ?? null,
+    },
+    input: request.input,
+  };
+  return createHash('sha256').update(canonicalJson(payload)).digest('hex');
+}
+
 // ---------------------------------------------------------------------------
 // Mission result contract
 // ---------------------------------------------------------------------------
@@ -116,7 +146,11 @@ export interface RuntimeMissionApprovalDecision {
   approvedBy: string | null;
 }
 
-export type RuntimeMissionIdempotencyOutcome = 'not_applicable' | 'first_execution' | 'duplicate';
+export type RuntimeMissionIdempotencyOutcome =
+  | 'not_applicable'
+  | 'first_execution'
+  | 'duplicate'
+  | 'mismatch';
 
 export interface RuntimeMissionIdempotencyResult {
   key: string | null;
@@ -169,6 +203,10 @@ export interface RuntimeMissionActionSpec {
    * replaying another while keeping product normalization out of the core.
    */
   resolveIdempotencyScope?: (request: RuntimeMissionRequest) => string | null;
+  /** Stable downstream operation identity persisted with replay evidence. */
+  downstreamOperationType?: string;
+  /** Product-owned exact provider identity; opaque bytes are preserved. */
+  resolveReplayProvider?: (request: RuntimeMissionRequest) => string | null;
 }
 
 /**
@@ -233,30 +271,58 @@ export function createMissionAdapterRegistry(adapters: RuntimeMissionAdapter[]):
  * (validation/approval/policy refusals) do not consume their key, so a
  * corrected retry with the same caller key still works.
  */
-export interface RuntimeMissionIdempotencyStore {
-  get(key: string): RuntimeMissionResult | undefined;
-  set(key: string, result: RuntimeMissionResult): void;
+export interface RuntimeMissionReplayBinding {
+  missionId: string;
+  action: string;
+  workspaceId: string | null;
+  provider: string | null;
+  accountId: string | null;
+  idempotencyKey: string;
+  payloadHash: string;
+  downstreamOperationType: string;
 }
 
-function scopedIdempotencyStoreKey(
+export interface RuntimeMissionIdempotencyRecord {
+  binding: RuntimeMissionReplayBinding;
+  result: RuntimeMissionResult;
+}
+
+export interface RuntimeMissionIdempotencyStore {
+  getByMissionId(missionId: string): RuntimeMissionIdempotencyRecord | undefined;
+  set(record: RuntimeMissionIdempotencyRecord): void;
+}
+
+function createReplayBinding(
   request: RuntimeMissionRequest,
   spec: RuntimeMissionActionSpec,
   callerKey: string
-): string {
-  return JSON.stringify([
-    'runtime-mission-idempotency-v4',
-    request.product,
-    request.action,
-    request.tenant.userId.trim(),
-    // A supplied workspace is part of the exact replay identity. Product
-    // validation rejects non-canonical values before this key is consulted.
-    request.tenant.workspaceId ?? null,
-    // Account ids are opaque and case-sensitive. Upstream canonical
-    // selection supplies tenant.accountId; preserve it byte-for-byte.
-    request.tenant.accountId ?? null,
-    spec.resolveIdempotencyScope?.(request) ?? null,
-    callerKey,
-  ]);
+): RuntimeMissionReplayBinding {
+  return {
+    missionId: request.missionId,
+    action: request.action,
+    workspaceId: request.tenant.workspaceId ?? null,
+    provider: spec.resolveReplayProvider?.(request)
+      ?? (typeof request.input.provider === 'string' ? request.input.provider : null),
+    accountId: request.tenant.accountId ?? null,
+    idempotencyKey: callerKey,
+    payloadHash: createRuntimeMissionPayloadHash(request),
+    downstreamOperationType:
+      spec.downstreamOperationType ?? `${request.product}:${request.action}`,
+  };
+}
+
+function replayBindingsEqual(
+  left: RuntimeMissionReplayBinding,
+  right: RuntimeMissionReplayBinding
+): boolean {
+  return left.missionId === right.missionId
+    && left.action === right.action
+    && left.workspaceId === right.workspaceId
+    && left.provider === right.provider
+    && left.accountId === right.accountId
+    && left.idempotencyKey === right.idempotencyKey
+    && left.payloadHash === right.payloadHash
+    && left.downstreamOperationType === right.downstreamOperationType;
 }
 
 /**
@@ -266,26 +332,29 @@ function scopedIdempotencyStoreKey(
  */
 const inFlightByStore = new WeakMap<
   RuntimeMissionIdempotencyStore,
-  Map<string, Promise<RuntimeMissionResult>>
+  Map<string, { binding: RuntimeMissionReplayBinding; result: Promise<RuntimeMissionResult> }>
 >();
 
 function inFlightExecutions(
   store: RuntimeMissionIdempotencyStore
-): Map<string, Promise<RuntimeMissionResult>> {
+): Map<string, { binding: RuntimeMissionReplayBinding; result: Promise<RuntimeMissionResult> }> {
   const existing = inFlightByStore.get(store);
   if (existing) return existing;
-  const created = new Map<string, Promise<RuntimeMissionResult>>();
+  const created = new Map<
+    string,
+    { binding: RuntimeMissionReplayBinding; result: Promise<RuntimeMissionResult> }
+  >();
   inFlightByStore.set(store, created);
   return created;
 }
 
 /** Simple per-process Map-backed store. Durable stores can implement the same interface. */
 export function createInMemoryIdempotencyStore(): RuntimeMissionIdempotencyStore {
-  const results = new Map<string, RuntimeMissionResult>();
+  const records = new Map<string, RuntimeMissionIdempotencyRecord>();
   return {
-    get: (key) => results.get(key),
-    set: (key, result) => {
-      results.set(key, result);
+    getByMissionId: (missionId) => records.get(missionId),
+    set: (record) => {
+      records.set(record.binding.missionId, record);
     },
   };
 }
@@ -297,6 +366,13 @@ export function createInMemoryIdempotencyStore(): RuntimeMissionIdempotencyStore
 export interface ExecuteMissionOptions {
   registry: RuntimeMissionAdapterRegistry;
   idempotencyStore?: RuntimeMissionIdempotencyStore;
+  failureInjector?: (
+    boundary:
+      | 'after_runtime_receives_queue_id_before_result_persistence'
+      | 'after_runtime_result_persistence',
+    request: RuntimeMissionRequest,
+    result?: RuntimeMissionResult
+  ) => void;
 }
 
 interface ResultDraft {
@@ -377,7 +453,9 @@ export async function executeMission(
       policyDecision: draft.policyDecision ?? null,
       approvalDecision: draft.approvalDecision ?? approvalDecisionDefault,
       idempotency: draft.idempotency ?? {
-        key: request.idempotencyKey?.trim() || null,
+        key: typeof request.idempotencyKey === 'string' && request.idempotencyKey.length > 0
+          ? request.idempotencyKey
+          : null,
         outcome: 'not_applicable',
       },
       startedAt,
@@ -390,6 +468,45 @@ export async function executeMission(
   const shapeErrors = validateRequestShape(request);
   if (shapeErrors.length > 0) {
     return finish({ status: 'validation_failed', errors: shapeErrors });
+  }
+
+  const storedMissionRecord = options.idempotencyStore?.getByMissionId(request.missionId);
+  if (storedMissionRecord) {
+    const requestedKey = typeof request.idempotencyKey === 'string' ? request.idempotencyKey : '';
+    const requestedProvider = typeof request.input.provider === 'string'
+      ? request.input.provider
+      : storedMissionRecord.binding.provider;
+    const scopeChanged = storedMissionRecord.binding.action !== request.action
+      || storedMissionRecord.binding.workspaceId !== (request.tenant.workspaceId ?? null)
+      || storedMissionRecord.binding.accountId !== (request.tenant.accountId ?? null)
+      || storedMissionRecord.binding.provider !== requestedProvider;
+    const code = storedMissionRecord.binding.idempotencyKey !== requestedKey
+      ? 'RUNTIME_IDEMPOTENCY_MISMATCH'
+      : scopeChanged
+        ? 'RUNTIME_REPLAY_SCOPE_MISMATCH'
+        : storedMissionRecord.binding.payloadHash !== createRuntimeMissionPayloadHash(request)
+          ? 'RUNTIME_PAYLOAD_MISMATCH'
+          : null;
+    if (code) {
+      return finish({
+        status: 'validation_failed',
+        output: null,
+        evidence: null,
+        errors: [{
+          code,
+          message: code === 'RUNTIME_IDEMPOTENCY_MISMATCH'
+            ? 'The mission is already bound to a different exact idempotency key.'
+            : code === 'RUNTIME_PAYLOAD_MISMATCH'
+              ? 'The mission is already bound to a different exact payload hash.'
+              : 'The mission replay tuple does not match its authoritative stored binding.',
+        }],
+        idempotency: {
+          key: requestedKey || null,
+          outcome: 'mismatch',
+          originalMissionId: storedMissionRecord.binding.missionId,
+        },
+      });
+    }
   }
 
   // 2. Adapter + action resolution — unknown products/actions fail clearly.
@@ -421,7 +538,10 @@ export async function executeMission(
   }
 
   // 3. Idempotency key requirement — fail closed when a write demands one.
-  const idempotencyKey = request.idempotencyKey?.trim() || null;
+  const idempotencyKey =
+    typeof request.idempotencyKey === 'string' && request.idempotencyKey.length > 0
+      ? request.idempotencyKey
+      : null;
   if (spec.requiresIdempotencyKey && !idempotencyKey) {
     return finish({
       status: 'validation_failed',
@@ -445,7 +565,36 @@ export async function executeMission(
   }
 
   const store = options.idempotencyStore;
-  const storeKey = idempotencyKey ? scopedIdempotencyStoreKey(request, spec, idempotencyKey) : null;
+  const replayBinding = idempotencyKey
+    ? createReplayBinding(request, spec, idempotencyKey)
+    : null;
+  const replayMismatch = (
+    existing: RuntimeMissionIdempotencyRecord | { binding: RuntimeMissionReplayBinding }
+  ): RuntimeMissionResult => {
+    const code = existing.binding.idempotencyKey !== replayBinding?.idempotencyKey
+      ? 'RUNTIME_IDEMPOTENCY_MISMATCH'
+      : existing.binding.payloadHash !== replayBinding?.payloadHash
+        ? 'RUNTIME_PAYLOAD_MISMATCH'
+        : 'RUNTIME_REPLAY_SCOPE_MISMATCH';
+    return finish({
+      status: 'validation_failed',
+      output: null,
+      evidence: null,
+      errors: [{
+        code,
+        message: code === 'RUNTIME_IDEMPOTENCY_MISMATCH'
+          ? 'The mission is already bound to a different exact idempotency key.'
+          : code === 'RUNTIME_PAYLOAD_MISMATCH'
+            ? 'The mission is already bound to a different exact payload hash.'
+            : 'The mission replay tuple does not match its authoritative stored binding.',
+      }],
+      idempotency: {
+        key: idempotencyKey,
+        outcome: 'mismatch',
+        originalMissionId: existing.binding.missionId,
+      },
+    });
+  };
   const replayExisting = (
     existing: RuntimeMissionResult,
     source: 'stored' | 'concurrent'
@@ -467,16 +616,37 @@ export async function executeMission(
       idempotency: { key: idempotencyKey, outcome: 'duplicate', originalMissionId: existing.missionId },
     });
   };
-  if (storeKey && store) {
-    const existing = store.get(storeKey);
+  if (replayBinding && store) {
+    const existing = store.getByMissionId(replayBinding.missionId);
     if (existing) {
-      return replayExisting(existing, 'stored');
+      if (!replayBindingsEqual(existing.binding, replayBinding)) {
+        return replayMismatch(existing);
+      }
+      return replayExisting(existing.result, 'stored');
     }
-    const inFlight = inFlightExecutions(store).get(storeKey);
+    const inFlight = inFlightExecutions(store).get(replayBinding.missionId);
     if (inFlight) {
-      const existingInFlightResult = await inFlight;
+      if (!replayBindingsEqual(inFlight.binding, replayBinding)) {
+        return replayMismatch(inFlight);
+      }
+      const existingInFlightResult = await inFlight.result;
       return replayExisting(existingInFlightResult, 'concurrent');
     }
+  }
+
+  if (
+    spec.requiresIdempotencyKey
+    && idempotencyKey
+    && idempotencyKey !== idempotencyKey.trim()
+  ) {
+    return finish({
+      status: 'validation_failed',
+      errors: [{
+        code: 'IDEMPOTENCY_KEY_NON_CANONICAL',
+        message: 'idempotencyKey must contain no surrounding whitespace.',
+      }],
+      idempotency: { key: idempotencyKey, outcome: 'mismatch' },
+    });
   }
 
   // 5. Real RuntimeTask — every existing lifecycle control now applies.
@@ -573,6 +743,27 @@ export async function executeMission(
       };
     }
 
+    const downstreamOutput = outcome.output !== null && typeof outcome.output === 'object'
+      && !Array.isArray(outcome.output)
+      ? outcome.output as Record<string, JsonValue>
+      : null;
+    const downstreamPost = downstreamOutput?.post !== null
+      && typeof downstreamOutput?.post === 'object'
+      && !Array.isArray(downstreamOutput.post)
+      ? downstreamOutput.post as Record<string, JsonValue>
+      : null;
+    const exactQueueId = typeof downstreamPost?.id === 'string'
+      && downstreamPost.id
+      && downstreamPost.id === downstreamPost.id.trim()
+      ? downstreamPost.id
+      : null;
+    if (outcome.ok && exactQueueId) {
+      options.failureInjector?.(
+        'after_runtime_receives_queue_id_before_result_persistence',
+        request
+      );
+    }
+
     for (const evidenceInput of outcome.evidence ?? []) {
       task = attachEvidence(task, evidenceInput);
     }
@@ -627,22 +818,25 @@ export async function executeMission(
     // 10. Only successful/duplicate downstream outcomes consume the Runtime
     // idempotency key. A refusal or unavailable dependency has no accepted side
     // effect to replay, and must remain retryable under corrected server truth.
-    if (storeKey && store && outcome.ok) {
-      store.set(storeKey, result);
+    if (replayBinding && store && outcome.ok) {
+      store.set({ binding: replayBinding, result });
     }
+    options.failureInjector?.('after_runtime_result_persistence', request, result);
     return result;
   };
 
-  if (storeKey && store) {
+  if (replayBinding && store) {
     const inFlight = inFlightExecutions(store);
     // Schedule execution in a microtask so the reservation is visible before
     // any adapter code can re-enter this runtime with the same scoped key.
     const execution = Promise.resolve().then(executeAfterGates);
-    inFlight.set(storeKey, execution);
+    inFlight.set(replayBinding.missionId, { binding: replayBinding, result: execution });
     try {
       return await execution;
     } finally {
-      if (inFlight.get(storeKey) === execution) inFlight.delete(storeKey);
+      if (inFlight.get(replayBinding.missionId)?.result === execution) {
+        inFlight.delete(replayBinding.missionId);
+      }
     }
   }
   return executeAfterGates();

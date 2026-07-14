@@ -488,16 +488,15 @@ describe('autoposter.post.schedule', () => {
       ),
       { registry, idempotencyStore }
     );
-    const explicitTiktokReplay = await executeMission(
+    const exactTiktokReplay = await executeMission(
       makeRequest(
         approvedSchedule(
           {
-            provider: 'tiktok',
             accountId: 'shared-channel-id',
-            mediaUrl: 'https://cdn.example.com/tiktok-retry.mp4',
+            mediaUrl: 'https://cdn.example.com/tiktok.mp4',
             scheduledAt,
           },
-          { missionId: 'mission-tiktok-replay' }
+          { missionId: 'mission-tiktok' }
         )
       ),
       { registry, idempotencyStore }
@@ -505,10 +504,10 @@ describe('autoposter.post.schedule', () => {
 
     assert.equal(tiktok.status, 'succeeded');
     assert.equal(youtube.status, 'succeeded');
-    assert.equal(explicitTiktokReplay.status, 'duplicate');
+    assert.equal(exactTiktokReplay.status, 'duplicate');
     assert.equal(tiktok.idempotency.outcome, 'first_execution');
     assert.equal(youtube.idempotency.outcome, 'first_execution');
-    assert.equal(explicitTiktokReplay.idempotency.originalMissionId, 'mission-tiktok');
+    assert.equal(exactTiktokReplay.idempotency.originalMissionId, 'mission-tiktok');
     assert.equal((tiktok.output as { post: { provider: string } }).post.provider, 'tiktok');
     assert.equal((youtube.output as { post: { provider: string } }).post.provider, 'youtube');
     assert.equal(calls.schedulePost.length, 2);
@@ -539,10 +538,7 @@ describe('autoposter.post.schedule', () => {
     );
 
     const first = await execute('mission-canonical', baseInput);
-    const exactReplay = await execute('mission-canonical-replay', {
-      ...baseInput,
-      mediaUrl: 'https://cdn.example.com/replay.mp4',
-    });
+    const exactReplay = await execute('mission-canonical', baseInput);
 
     assert.equal(first.status, 'succeeded');
     assert.equal(exactReplay.status, 'duplicate');

@@ -33,6 +33,8 @@ import type {
   AutoPosterQueueListParams,
   AutoPosterQueueListSuccess,
   AutoPosterScheduleParams,
+  AutoPosterScheduleReconciliationParams,
+  AutoPosterScheduleReconciliationSuccess,
   AutoPosterScheduleSuccess,
 } from './autoPosterMissionAdapter.js';
 import { redactText } from '../redaction.js';
@@ -103,6 +105,12 @@ const CONNECTED_ACCOUNT_REASON_CODES = new Set<AutoPosterConnectedAccountReasonC
   'account_not_publishing_ready',
 ]);
 
+const RECOVERY_REASON_CODES = new Set([
+  'recovery_scope_mismatch',
+  'reconciliation_required',
+  'recovery_evidence_invalid',
+]);
+
 const CONNECTED_ACCOUNT_PROVIDERS = new Set(['tiktok', 'youtube']);
 const CONNECTED_ACCOUNT_READINESS_BLOCKERS = new Set([
   'provider_not_active',
@@ -135,7 +143,8 @@ function safeFailureDetails(record: Record<string, unknown>): AutoPosterCommerci
         : '';
   const reasonCode = candidateReasonCode
     && (COMMERCIAL_DENIAL_REASON_CODES.has(candidateReasonCode)
-      || CONNECTED_ACCOUNT_REASON_CODES.has(candidateReasonCode as AutoPosterConnectedAccountReasonCode))
+      || CONNECTED_ACCOUNT_REASON_CODES.has(candidateReasonCode as AutoPosterConnectedAccountReasonCode)
+      || RECOVERY_REASON_CODES.has(candidateReasonCode))
     ? candidateReasonCode
     : '';
   if (reasonCode) details.reasonCode = reasonCode;
@@ -379,7 +388,112 @@ export function createAutoPosterHttpPort(options: AutoPosterHttpPortOptions): Au
         scheduledAt: params.scheduledAt,
         idempotencyKey: params.idempotencyKey,
         requestedBy: params.requestedBy,
+        missionId: params.missionId,
+        action: params.action,
+        missionPayloadHash: params.missionPayloadHash,
       }, params.traceId);
+    },
+    async reconcileSchedule(params: AutoPosterScheduleReconciliationParams) {
+      const result = await call<AutoPosterScheduleReconciliationSuccess>(
+        'POST',
+        '/api/runtime/schedule/reconcile',
+        {
+          workspaceId: params.workspaceId,
+          accountId: params.accountId,
+          provider: params.provider,
+          scheduledAt: params.scheduledAt,
+          idempotencyKey: params.idempotencyKey,
+          missionId: params.missionId,
+          action: params.action,
+          missionPayloadHash: params.missionPayloadHash,
+        },
+        params.traceId
+      );
+      if (!result.ok) return result;
+
+      const validCommon = Number.isInteger(result.count)
+        && result.count >= 0
+        && typeof result.unique === 'boolean'
+        && typeof result.safeToReuse === 'boolean'
+        && ['not_started', 'required', 'approved', 'unknown'].includes(result.approvalState)
+        && [
+          'not_started',
+          'blocked_until_human_approval',
+          'processing',
+          'posted',
+          'failed',
+          'unknown',
+        ].includes(result.publishingState)
+        && [
+          'not_found',
+          'authoritative',
+          'conflict',
+          'invalid',
+          'scope_mismatch',
+          'idempotency_mismatch',
+          'payload_mismatch',
+        ].includes(result.evidenceStatus);
+      if (!validCommon) {
+        return failure('internal', 'AutoPoster returned an invalid reconciliation response.');
+      }
+
+      if (result.outcome === 'not_found') {
+        if (result.count !== 0 || !result.unique || result.safeToReuse || result.post) {
+          return failure('internal', 'AutoPoster returned contradictory not-found reconciliation truth.');
+        }
+        return result;
+      }
+      if (result.outcome === 'conflict') {
+        const ids = result.conflictingPostIds;
+        if (
+          result.count < 2
+          || result.unique
+          || result.safeToReuse
+          || result.post
+          || !Array.isArray(ids)
+          || ids.length !== result.count
+          || ids.some((id) => typeof id !== 'string' || !id || id !== id.trim())
+        ) {
+          return failure('internal', 'AutoPoster returned contradictory conflict reconciliation truth.');
+        }
+        return result;
+      }
+      if (
+        result.outcome === 'scope_mismatch'
+        || result.outcome === 'idempotency_mismatch'
+        || result.outcome === 'payload_mismatch'
+      ) {
+        if (result.count < 1 || result.safeToReuse || result.post) {
+          return failure('internal', 'AutoPoster returned contradictory mismatch reconciliation truth.');
+        }
+        return result;
+      }
+      if (result.outcome !== 'unique' || result.count !== 1 || !result.unique) {
+        return failure('internal', 'AutoPoster returned an unknown reconciliation outcome.');
+      }
+      if (!result.safeToReuse) {
+        if (result.post) {
+          return failure('internal', 'AutoPoster exposed queue evidence it marked unsafe to reuse.');
+        }
+        return result;
+      }
+      const post = result.post;
+      const postId = typeof post?.id === 'string' ? post.id : '';
+      const scheduledAt = typeof post?.scheduledAt === 'string' ? post.scheduledAt : '';
+      if (
+        !post
+        || !postId
+        || postId !== postId.trim()
+        || post.accountId !== params.accountId
+        || post.provider !== params.provider
+        || post.status !== 'scheduled'
+        || post.approved !== false
+        || !scheduledAt
+        || scheduledAt !== params.scheduledAt
+      ) {
+        return failure('internal', 'AutoPoster returned unsafe recovered queue evidence.');
+      }
+      return result;
     },
     async listConnectedAccounts(params: AutoPosterConnectedAccountListParams) {
       const query = new URLSearchParams();

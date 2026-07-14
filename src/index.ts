@@ -103,10 +103,13 @@ export type {
   RuntimeMissionAdapterOutcome,
   RuntimeMissionAdapter,
   RuntimeMissionAdapterRegistry,
+  RuntimeMissionReplayBinding,
+  RuntimeMissionIdempotencyRecord,
   RuntimeMissionIdempotencyStore,
   ExecuteMissionOptions,
 } from './missions.js';
 export {
+  createRuntimeMissionPayloadHash,
   createMissionAdapterRegistry,
   createInMemoryIdempotencyStore,
   executeMission,
@@ -129,10 +132,13 @@ export type {
   AutoPosterPostStatusSuccess,
   AutoPosterMediaValidationSuccess,
   AutoPosterScheduleSuccess,
+  AutoPosterScheduleReconciliationOutcome,
+  AutoPosterScheduleReconciliationSuccess,
   AutoPosterQueueListParams,
   AutoPosterPostStatusParams,
   AutoPosterMediaValidationParams,
   AutoPosterScheduleParams,
+  AutoPosterScheduleReconciliationParams,
   AutoPosterOperationsPort,
 } from './adapters/autoPosterMissionAdapter.js';
 export {
