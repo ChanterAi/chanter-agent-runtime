@@ -96,6 +96,7 @@ function makeFakePort(overrides: Partial<AutoPosterOperationsPort> = {}): {
         post: {
           id: 'post-new',
           accountId: params.accountId,
+          provider: params.provider ?? 'tiktok',
           status: 'scheduled',
           scheduledAt: params.scheduledAt,
           approved: false,
@@ -316,12 +317,21 @@ describe('autoposter.post.schedule', () => {
     const scheduledAt = futureIso();
     const { result, calls } = await run(
       {},
-      approvedSchedule({ accountId: 'account-a', mediaUrl: 'https://cdn.example.com/a.mp4', scheduledAt, caption: 'Launch' })
+      approvedSchedule(
+        { accountId: 'account-a', mediaUrl: 'https://cdn.example.com/a.mp4', scheduledAt, caption: 'Launch' },
+        { traceId: ' trace-ap-1 ' }
+      )
     );
     assert.equal(result.status, 'succeeded');
     assert.equal(calls.schedulePost.length, 1);
-    const params = calls.schedulePost[0] as { scheduledAt: string; idempotencyKey: string; requestedBy: string };
+    const params = calls.schedulePost[0] as {
+      scheduledAt: string;
+      traceId: string;
+      idempotencyKey: string;
+      requestedBy: string;
+    };
     assert.equal(params.scheduledAt, new Date(scheduledAt).toISOString());
+    assert.equal(params.traceId, 'trace-ap-1');
     assert.equal(params.idempotencyKey, 'idem-1');
     assert.equal(params.requestedBy, 'mcp-client');
     const output = result.output as { post: { id: string }; publishing: string; duplicate: boolean };
@@ -377,6 +387,7 @@ describe('autoposter.post.schedule', () => {
     assert.equal('title' in params, false);
     assert.equal('description' in params, false);
     assert.equal('workspaceId' in params, false, 'legacy missions remain workspace-optional');
+    assert.equal(params.traceId, 'mission-ap-1', 'traceId defaults to missionId when omitted');
   });
 
   it('uses only the tenant workspace and ignores caller-supplied plan/workspace claims', async () => {
@@ -518,6 +529,138 @@ describe('autoposter.post.schedule', () => {
     assert.equal(result.evidence!.result!.success, false);
     const serialized = JSON.stringify(result);
     assert.ok(!serialized.includes('"status":"succeeded"'));
+  });
+
+  it('rejects schedule responses that do not prove an identifiable, unapproved queue draft', async () => {
+    for (const duplicate of [undefined, 'false']) {
+      const invalidDuplicate = await run(
+        {
+          async schedulePost(params) {
+            return {
+              ok: true,
+              duplicate,
+              post: {
+                id: 'post-invalid-duplicate',
+                accountId: params.accountId,
+                status: 'scheduled',
+                scheduledAt: params.scheduledAt,
+                approved: false,
+              },
+            } as unknown as Awaited<ReturnType<AutoPosterOperationsPort['schedulePost']>>;
+          },
+        },
+        approvedSchedule({ accountId: 'account-a', mediaUrl: 'https://cdn.example.com/a.mp4', scheduledAt: futureIso() })
+      );
+      assert.equal(invalidDuplicate.result.status, 'failed');
+      assert.equal(invalidDuplicate.result.errors[0]!.code, 'AUTOPOSTER_INVALID_SCHEDULE_RESPONSE');
+      assert.equal(invalidDuplicate.result.evidence!.result!.success, false);
+    }
+
+    const unsafeApproval = await run(
+      {
+        async schedulePost(params) {
+          return {
+            ok: true,
+            duplicate: false,
+            post: {
+              id: 'post-unsafe',
+              accountId: params.accountId,
+              status: 'scheduled',
+              scheduledAt: params.scheduledAt,
+              approved: true,
+            },
+          };
+        },
+      },
+      approvedSchedule({ accountId: 'account-a', mediaUrl: 'https://cdn.example.com/a.mp4', scheduledAt: futureIso() })
+    );
+    assert.equal(unsafeApproval.result.status, 'failed');
+    assert.equal(unsafeApproval.result.errors[0]!.code, 'AUTOPOSTER_UNSAFE_SCHEDULE_RESPONSE');
+    assert.equal(unsafeApproval.result.evidence!.result!.success, false);
+
+    const missingPostId = await run(
+      {
+        async schedulePost(params) {
+          return {
+            ok: true,
+            duplicate: false,
+            post: {
+              id: ' ',
+              accountId: params.accountId,
+              status: 'scheduled',
+              scheduledAt: params.scheduledAt,
+              approved: false,
+            },
+          };
+        },
+      },
+      approvedSchedule({ accountId: 'account-a', mediaUrl: 'https://cdn.example.com/a.mp4', scheduledAt: futureIso() })
+    );
+    assert.equal(missingPostId.result.status, 'failed');
+    assert.equal(missingPostId.result.errors[0]!.code, 'AUTOPOSTER_INVALID_SCHEDULE_RESPONSE');
+    assert.equal(missingPostId.result.evidence!.result!.success, false);
+
+    for (const postOverride of [
+      { accountId: 'account-b' },
+      { status: 'published' },
+      { scheduledAt: futureIso(180) },
+    ]) {
+      const mismatchedDraft = await run(
+        {
+          async schedulePost(params) {
+            return {
+              ok: true,
+              duplicate: false,
+              post: {
+                id: 'post-mismatched',
+                accountId: params.accountId,
+                status: 'scheduled',
+                scheduledAt: params.scheduledAt,
+                approved: false,
+                ...postOverride,
+              },
+            };
+          },
+        },
+        approvedSchedule({
+          accountId: 'account-a',
+          mediaUrl: 'https://cdn.example.com/a.mp4',
+          scheduledAt: futureIso(),
+        })
+      );
+      assert.equal(mismatchedDraft.result.status, 'failed');
+      assert.equal(mismatchedDraft.result.errors[0]!.code, 'AUTOPOSTER_UNSAFE_SCHEDULE_RESPONSE');
+      assert.equal(mismatchedDraft.result.evidence!.result!.success, false);
+    }
+
+    const mismatchedProvider = await run(
+      {
+        async schedulePost(params) {
+          return {
+            ok: true,
+            duplicate: false,
+            post: {
+              id: 'post-wrong-provider',
+              accountId: params.accountId,
+              provider: 'tiktok',
+              status: 'scheduled',
+              scheduledAt: params.scheduledAt,
+              approved: false,
+            },
+          };
+        },
+      },
+      approvedSchedule({
+        accountId: 'account-a',
+        provider: 'youtube',
+        title: 'Launch',
+        mediaUrl: 'https://cdn.example.com/a.mp4',
+        scheduledAt: futureIso(),
+      })
+    );
+    assert.equal(mismatchedProvider.result.status, 'failed');
+    assert.equal(mismatchedProvider.result.errors[0]!.code, 'AUTOPOSTER_UNSAFE_SCHEDULE_RESPONSE');
+    assert.equal(mismatchedProvider.result.evidence!.result!.success, false);
   });
 
   it('the adapter exposes no publish action and its specs never use publish policy types', () => {

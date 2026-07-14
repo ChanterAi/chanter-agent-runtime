@@ -110,6 +110,7 @@ export interface AutoPosterScheduleSuccess {
   post: {
     id: string;
     accountId: string;
+    provider?: string;
     status: string;
     scheduledAt: string | null;
     approved: boolean;
@@ -154,6 +155,8 @@ export interface AutoPosterScheduleParams {
   title?: string;
   description?: string;
   scheduledAt: string;
+  /** Mission correlation id forwarded to AutoPoster without changing scheduling semantics. */
+  traceId?: string;
   idempotencyKey: string;
   requestedBy: string;
 }
@@ -253,6 +256,24 @@ function portFailureOutcome(action: string, failure: AutoPosterPortFailure): Run
         type: 'note',
         label: `autoposter-${failure.code}`,
         detail: `${action} failed downstream: ${failure.message}`,
+      },
+    ],
+  };
+}
+
+function invalidScheduleResponseOutcome(
+  code: 'AUTOPOSTER_INVALID_SCHEDULE_RESPONSE' | 'AUTOPOSTER_UNSAFE_SCHEDULE_RESPONSE',
+  message: string
+): RuntimeMissionAdapterOutcome {
+  return {
+    ok: false,
+    status: 'failed',
+    errors: [{ code, message }],
+    evidence: [
+      {
+        type: 'note',
+        label: 'autoposter-schedule-response-rejected',
+        detail: `${message} The runtime did not accept the operation as a successful queue draft.`,
       },
     ],
   };
@@ -458,11 +479,55 @@ export function createAutoPosterMissionAdapter(port: AutoPosterOperationsPort): 
       ...(title ? { title } : {}),
       ...(description ? { description } : {}),
       scheduledAt: scheduledAtIso,
+      traceId: request.traceId?.trim() || request.missionId,
       // executeMission guarantees this is present for requiresIdempotencyKey actions.
       idempotencyKey: request.idempotencyKey!.trim(),
       requestedBy: request.actor.id,
     });
     if (!result.ok) return portFailureOutcome(AUTOPOSTER_ACTIONS.postSchedule, result);
+    if (typeof result.duplicate !== 'boolean') {
+      return invalidScheduleResponseOutcome(
+        'AUTOPOSTER_INVALID_SCHEDULE_RESPONSE',
+        'AutoPoster returned a schedule response without a valid duplicate flag.'
+      );
+    }
+
+    const post = result.post as AutoPosterScheduleSuccess['post'] | undefined;
+    const postId = typeof post?.id === 'string' ? post.id.trim() : '';
+    if (!post || !postId) {
+      return invalidScheduleResponseOutcome(
+        'AUTOPOSTER_INVALID_SCHEDULE_RESPONSE',
+        'AutoPoster returned a schedule response without a valid post.id.'
+      );
+    }
+    if (post.approved !== false) {
+      return invalidScheduleResponseOutcome(
+        'AUTOPOSTER_UNSAFE_SCHEDULE_RESPONSE',
+        'AutoPoster did not confirm that the scheduled queue draft is unapproved.'
+      );
+    }
+    const postAccountId = typeof post.accountId === 'string' ? post.accountId.trim() : '';
+    const expectedProvider = provider || 'tiktok';
+    const postProvider =
+      typeof post.provider === 'string'
+        ? post.provider.trim().toLowerCase()
+        : provider
+          ? ''
+          : 'tiktok';
+    const postStatus = typeof post.status === 'string' ? post.status.trim() : '';
+    const postScheduledAt = typeof post.scheduledAt === 'string' ? post.scheduledAt.trim() : '';
+    if (
+      postAccountId !== accountId ||
+      postProvider !== expectedProvider ||
+      postStatus !== 'scheduled' ||
+      !postScheduledAt ||
+      Date.parse(postScheduledAt) !== Date.parse(scheduledAtIso)
+    ) {
+      return invalidScheduleResponseOutcome(
+        'AUTOPOSTER_UNSAFE_SCHEDULE_RESPONSE',
+        'AutoPoster did not confirm the requested provider, account, and scheduled draft state.'
+      );
+    }
 
     return {
       ok: true,
@@ -470,11 +535,12 @@ export function createAutoPosterMissionAdapter(port: AutoPosterOperationsPort): 
       output: {
         duplicate: result.duplicate,
         post: {
-          id: result.post.id,
-          accountId: result.post.accountId,
-          status: result.post.status,
-          scheduledAt: result.post.scheduledAt,
-          approved: result.post.approved,
+          id: postId,
+          accountId: postAccountId,
+          provider: postProvider,
+          status: postStatus,
+          scheduledAt: postScheduledAt,
+          approved: post.approved,
         },
         publishing: 'blocked_until_human_approval',
       },
@@ -486,8 +552,8 @@ export function createAutoPosterMissionAdapter(port: AutoPosterOperationsPort): 
           type: 'note',
           label: result.duplicate ? 'autoposter-schedule-duplicate' : 'autoposter-schedule-created',
           detail: result.duplicate
-            ? `Existing queue item ${result.post.id} returned for the supplied idempotency key; no duplicate was created.`
-            : `Queue item ${result.post.id} created for account ${result.post.accountId}, scheduled for ${result.post.scheduledAt}; publishing remains blocked until human approval in AutoPoster.`,
+            ? `Existing queue item ${postId} returned for the supplied idempotency key; no duplicate was created.`
+            : `Queue item ${postId} created for account ${postAccountId}, scheduled for ${postScheduledAt}; publishing remains blocked until human approval in AutoPoster.`,
         },
       ],
     };

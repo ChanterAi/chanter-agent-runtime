@@ -45,6 +45,25 @@ export const RUNTIME_CONTROL_TOKEN_HEADER = 'x-chanter-runtime-token';
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 
+function containsProtectedValue(
+  value: unknown,
+  protectedValue: string,
+  seen = new Set<object>()
+): boolean {
+  if (typeof value === 'string') return value.includes(protectedValue);
+  if (value === null || typeof value !== 'object') return false;
+  if (seen.has(value)) return false;
+  seen.add(value);
+
+  if (Array.isArray(value)) {
+    return value.some((item) => containsProtectedValue(item, protectedValue, seen));
+  }
+
+  return Object.entries(value).some(
+    ([key, item]) => key.includes(protectedValue) || containsProtectedValue(item, protectedValue, seen)
+  );
+}
+
 // AutoPoster uses 409 for server-authoritative commercial refusals as well as
 // ordinary request conflicts. Only these canonical domain decisions are
 // promoted to `forbidden`; unrelated 409/404 responses retain their normal
@@ -136,10 +155,12 @@ export function createAutoPosterHttpPort(options: AutoPosterHttpPortOptions): Au
   async function call<TSuccess extends { ok: true }>(
     method: 'GET' | 'POST',
     path: string,
-    body?: Record<string, unknown>
+    body?: Record<string, unknown>,
+    correlationId?: string
   ): Promise<TSuccess | AutoPosterPortFailure> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const normalizedCorrelationId = correlationId?.trim();
     let response: Response;
     try {
       response = await fetchImpl(`${baseUrl}${path}`, {
@@ -148,6 +169,7 @@ export function createAutoPosterHttpPort(options: AutoPosterHttpPortOptions): Au
           [RUNTIME_CONTROL_TOKEN_HEADER]: serviceToken,
           accept: 'application/json',
           ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
+          ...(normalizedCorrelationId ? { 'x-correlation-id': normalizedCorrelationId } : {}),
         },
         ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
         signal: controller.signal,
@@ -167,6 +189,19 @@ export function createAutoPosterHttpPort(options: AutoPosterHttpPortOptions): Au
       return failure(
         response.ok ? 'internal' : statusToErrorCode(response.status),
         `AutoPoster returned a non-JSON response (HTTP ${response.status}) for ${method} ${path}.`
+      );
+    }
+
+    if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+      return failure(
+        response.ok ? 'internal' : statusToErrorCode(response.status),
+        `AutoPoster returned a malformed JSON response (HTTP ${response.status}) for ${method} ${path}.`
+      );
+    }
+    if (containsProtectedValue(payload, serviceToken)) {
+      return failure(
+        'internal',
+        `AutoPoster returned a response containing protected credentials for ${method} ${path}.`
       );
     }
 
@@ -223,7 +258,7 @@ export function createAutoPosterHttpPort(options: AutoPosterHttpPortOptions): Au
         scheduledAt: params.scheduledAt,
         idempotencyKey: params.idempotencyKey,
         requestedBy: params.requestedBy,
-      });
+      }, params.traceId);
     },
   };
 }

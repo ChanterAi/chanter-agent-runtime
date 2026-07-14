@@ -11,7 +11,7 @@ import {
   RUNTIME_CONTROL_TOKEN_HEADER,
 } from '../../src/adapters/autoPosterHttpPort.js';
 
-const TOKEN = 'runtime-test-token-abc123';
+const TOKEN = 'opaquecredentialvalue';
 
 interface RecordedCall {
   url: string;
@@ -202,6 +202,14 @@ describe('createAutoPosterHttpPort — status mapping', () => {
     assert.equal(result.ok, false);
   });
 
+  it('a malformed JSON value preserves the HTTP-derived failure classification', async () => {
+    const { fetchImpl } = makeFetch(() => ({ status: 503, json: null }));
+    const port = makePort(fetchImpl);
+    const result = await port.listQueue({ userId: 'owner', limit: 5 });
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.code, 'unavailable');
+  });
+
   it('a non-JSON response maps to a structured failure', async () => {
     const { fetchImpl } = makeFetch(() => ({ status: 200, nonJson: true }));
     const port = makePort(fetchImpl);
@@ -243,10 +251,43 @@ describe('createAutoPosterHttpPort — reachability and boundedness', () => {
     assert.equal(calls.length, 1, 'exactly one attempt — retries could duplicate scheduling');
   });
 
-  it('failure messages never contain the service token', async () => {
-    const { fetchImpl } = makeFetch(() => ({ status: 500, json: { ok: false, reason: 'boom' } }));
+  it('rejects a downstream failure that echoes the exact service token', async () => {
+    const { fetchImpl } = makeFetch(() => ({
+      status: 500,
+      json: { ok: false, reason: `downstream echoed ${TOKEN}` },
+    }));
     const port = makePort(fetchImpl);
     const result = await port.listQueue({ userId: 'owner', limit: 5 });
+    assert.equal(result.ok, false);
+    assert.ok(!JSON.stringify(result).includes(TOKEN));
+  });
+
+  it('rejects a purported success that echoes the exact service token', async () => {
+    const { fetchImpl } = makeFetch(() => ({
+      status: 201,
+      json: {
+        ok: true,
+        duplicate: false,
+        post: {
+          id: TOKEN,
+          accountId: 'account-a',
+          status: 'scheduled',
+          scheduledAt: '2099-07-11T09:00:00.000Z',
+          approved: false,
+        },
+      },
+    }));
+    const port = makePort(fetchImpl);
+    const result = await port.schedulePost({
+      userId: 'owner',
+      accountId: 'account-a',
+      mediaUrl: 'https://cdn.example.com/a.mp4',
+      caption: '',
+      hashtags: '',
+      scheduledAt: '2099-07-11T09:00:00.000Z',
+      idempotencyKey: 'idem-token-echo',
+      requestedBy: 'mcp-client',
+    });
     assert.equal(result.ok, false);
     assert.ok(!JSON.stringify(result).includes(TOKEN));
   });
@@ -268,6 +309,7 @@ describe('createAutoPosterHttpPort — reachability and boundedness', () => {
       caption: 'Launch',
       hashtags: '#go',
       scheduledAt: '2099-07-11T09:00:00.000Z',
+      traceId: ' trace-99 ',
       idempotencyKey: 'idem-9',
       requestedBy: 'mcp-client',
     });
@@ -275,6 +317,8 @@ describe('createAutoPosterHttpPort — reachability and boundedness', () => {
     const body = JSON.parse(calls[0]!.body!) as Record<string, unknown>;
     assert.equal(body.accountId, 'account-a');
     assert.equal(body.idempotencyKey, 'idem-9');
+    assert.equal(calls[0]!.headers['x-correlation-id'], 'trace-99');
+    assert.equal(body.traceId, undefined, 'trace identity belongs in the correlation header, not the request body');
     assert.equal(body.userId, undefined, 'tenant identity must be derived server-side from the token');
     assert.equal('provider' in body, false, 'a TikTok schedule carries no provider field (backward compatibility)');
     assert.equal('title' in body, false);
@@ -298,6 +342,7 @@ describe('createAutoPosterHttpPort — reachability and boundedness', () => {
       caption: '',
       hashtags: '',
       scheduledAt: '2099-07-11T09:00:00.000Z',
+      traceId: '   ',
       idempotencyKey: 'idem-workspace',
       requestedBy: 'mcp-client',
     });
@@ -306,6 +351,7 @@ describe('createAutoPosterHttpPort — reachability and boundedness', () => {
     assert.equal(body.workspaceId, 'workspace-a');
     assert.equal('planId' in body, false);
     assert.equal('entitlements' in body, false);
+    assert.equal(calls[0]!.headers['x-correlation-id'], undefined, 'blank traceId must not emit a header');
   });
 
   it('a YouTube schedule carries provider, title, and description in the body', async () => {
