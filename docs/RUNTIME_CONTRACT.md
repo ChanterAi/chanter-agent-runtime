@@ -269,3 +269,35 @@ npm test            # node --test dist/tests/**/*.test.js — runs the compiled 
 
 `npm test` runs compiled output, so `npm run build` (or `npm run typecheck` for a
 type-only pass) must be run first after any source change.
+
+## 14. Agent Run Ledger v1 contract
+
+`src/agentRunLedger.ts` is the canonical, additive `AgentRunLedgerEntry` wire contract.
+It is intentionally separate from `RuntimeTask` and `RuntimeMission`: Loop Governor is
+the first producer, while Operator owns durable persistence and read-only supervision.
+The contract adds no AutoPoster action and does not change the existing mission replay
+hash or recovery path.
+
+The wire shape uses `schema_version: "1.0"`, snake_case fields, explicit nulls, a
+one-based integer `sequence`, bounded structured actions/tools/evidence/cost, and its
+own ledger status and outcome vocabularies. Provider and model are required inputs;
+callers must provide an observed value or the explicit `unknown`/`not_applicable`
+sentinel. Known cost uses integer micros plus a three-letter currency. No value is
+defaulted or inferred. Timestamps use canonical UTC milliseconds
+(`YYYY-MM-DDTHH:mm:ss.sssZ`); `completed_at` and `latency_ms` remain null until a
+terminal state.
+
+Hashing is cross-language deterministic:
+
+1. canonical JSON recursively sorts object keys, preserves array order, and emits
+   compact UTF-8 JSON; P0 numeric fields are integers;
+2. `scope_hash` is SHA-256 over UTF-8 bytes of
+   `agent-run-ledger-scope-v1\n` plus the canonical scope object;
+3. `payload_hash` is SHA-256 over UTF-8 bytes of
+   `agent-run-ledger-payload-v1\n` plus the canonical full entry without either hash.
+
+The exact scope fields are `schema_version`, `run_id`, `product_id`, `workflow_id`,
+`agent_id`, `attempt_id`, `parent_run_id`, `trace_id`, `provider`, `model`,
+`production_impact`, and `source_subsystem`. Opaque identifiers and references are
+never trimmed or lowercased. Free text is redacted before hashing; secret-bearing
+opaque fields and signed credential URLs are rejected with typed validation errors.

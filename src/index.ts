@@ -79,6 +79,48 @@ export type {
 } from './providerRouting.js';
 export { selectProviderRoute } from './providerRouting.js';
 
+// ── Canonical Agent Run Ledger contract ──
+export type {
+  AgentRunLedgerStatus,
+  AgentRunLedgerOutcome,
+  AgentRunLedgerApprovalStatus,
+  AgentRunLedgerValidationOutcome,
+  AgentRunLedgerEvidenceIntegrityStatus,
+  AgentRunLedgerActionOutcome,
+  AgentRunLedgerEvidenceKind,
+  AgentRunLedgerCostEstimate,
+  AgentRunLedgerAction,
+  AgentRunLedgerTool,
+  AgentRunLedgerEvidenceRef,
+  AgentRunLedgerEntry,
+  AgentRunLedgerEntryDraft,
+  AgentRunLedgerValidationIssueCode,
+  AgentRunLedgerValidationIssue,
+  AgentRunLedgerTransitionErrorCode,
+  AgentRunLedgerReplayMismatchCode,
+  AgentRunLedgerHashVerification,
+} from './agentRunLedger.js';
+export {
+  AGENT_RUN_LEDGER_SCHEMA_VERSION,
+  AGENT_RUN_LEDGER_SCOPE_HASH_DOMAIN,
+  AGENT_RUN_LEDGER_PAYLOAD_HASH_DOMAIN,
+  AGENT_RUN_LEDGER_LIMITS,
+  AgentRunLedgerValidationError,
+  AgentRunLedgerTransitionError,
+  AgentRunLedgerReplayMismatchError,
+  canonicalizeAgentRunLedgerJson,
+  redactAgentRunLedgerFreeText,
+  createAgentRunLedgerScopeHash,
+  createAgentRunLedgerPayloadHash,
+  deriveAgentRunLedgerOutcome,
+  normalizeAgentRunLedgerEntry,
+  createAgentRunLedgerEntry,
+  validateAgentRunLedgerEntry,
+  verifyAgentRunLedgerHashes,
+  assertAgentRunLedgerTransition,
+  assertAgentRunLedgerExactReplay,
+} from './agentRunLedger.js';
+
 // ── Generic adapter contract ──
 export type {
   RuntimeAdapterInputEnvelope,
