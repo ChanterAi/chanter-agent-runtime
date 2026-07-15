@@ -7,7 +7,7 @@
   "types": "dist/src/index.d.ts",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --test dist/tests/**/*.test.js",
+    "test": "node scripts/run-tests.mjs",
     "build": "tsc",
     "clean": "rm -rf dist"
   },

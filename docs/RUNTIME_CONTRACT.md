@@ -264,7 +264,7 @@ From `apps/chanter-agent-runtime`:
 ```
 npm run build       # tsc — compiles src/ and tests/ to dist/
 npm run typecheck   # tsc --noEmit — type-checks without emitting
-npm test            # node --test dist/tests/**/*.test.js — runs the compiled suite
+npm test            # recursively discovers and runs every compiled *.test.js file
 ```
 
 `npm test` runs compiled output, so `npm run build` (or `npm run typecheck` for a

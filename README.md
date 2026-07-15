@@ -34,7 +34,8 @@ npm test
 
 ## Status
 
-Real, tested runtime (187 tests passing, verified 2026-07-10). Consumed by
+Real, tested runtime (266 tests passing, including the Phase 2A mission-envelope
+contract, verified 2026-07-15). Consumed by
 chanter-Operator's backend: `apps/backend/package.json` declares a `file:` dependency and
 Operator's runtime bridge imports this package's contract, policy, redaction, and
 provider-routing modules (see [docs/RUNTIME_CONTRACT.md](docs/RUNTIME_CONTRACT.md)).

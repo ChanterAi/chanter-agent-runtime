@@ -206,3 +206,19 @@ export {
   safeCommitAdapter,
   SAMPLE_ADVISORY_CONTRACT,
 } from './adapters/safeCommitAdapter.js';
+
+// ── Mission ingress envelope (Phase 2A) ──
+export type {
+  MissionEnvelopeSourceSystem,
+  ChanterMissionEnvelopeSource,
+  ChanterMissionEnvelopeTarget,
+  ChanterMissionEnvelopeV1,
+  MissionEnvelopeValidationError,
+} from './missionEnvelope.js';
+export {
+  MISSION_ENVELOPE_SCHEMA_VERSION,
+  validateMissionEnvelope,
+  canonicalEnvelopeJson,
+  createEnvelopePayloadHash,
+  envelopeToRuntimeMissionRequest,
+} from './missionEnvelope.js';
