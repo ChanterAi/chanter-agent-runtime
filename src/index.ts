@@ -192,6 +192,32 @@ export {
 export type { AutoPosterHttpPortOptions } from './adapters/autoPosterHttpPort.js';
 export { createAutoPosterHttpPort, RUNTIME_CONTROL_TOKEN_HEADER } from './adapters/autoPosterHttpPort.js';
 
+// ── Loop Governor mission adapter + process port (Phase 2C) ──
+export type {
+  LoopGovernorManualLoopTaskInput,
+  LoopGovernorManualLoopCreateParams,
+  LoopGovernorManualLoopLookupParams,
+  LoopGovernorManualLoopCreateSuccess,
+  LoopGovernorManualLoopLookupOutcome,
+  LoopGovernorManualLoopBinding,
+  LoopGovernorManualLoopLookupSuccess,
+  LoopGovernorPortErrorCode,
+  LoopGovernorPortFailure,
+  LoopGovernorMissionPort,
+  LoopGovernorSpawnImplementation,
+  LoopGovernorProcessPortOptions,
+} from './adapters/loopGovernorProcessPort.js';
+export {
+  LOOP_GOVERNOR_MISSION_INTAKE_ARGS,
+  createLoopGovernorProcessPort,
+} from './adapters/loopGovernorProcessPort.js';
+export {
+  LOOP_GOVERNOR_ACTIONS,
+  LOOP_GOVERNOR_DOWNSTREAM_OPERATION_TYPE,
+  createLoopGovernorMissionAdapter,
+  validateManualLoopInput,
+} from './adapters/loopGovernorMissionAdapter.js';
+
 // ── Product adapters ──
 export type {
   SafeCommitVerdict,
