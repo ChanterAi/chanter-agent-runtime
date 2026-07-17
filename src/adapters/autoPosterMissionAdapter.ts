@@ -30,13 +30,19 @@ import { createRuntimeMissionPayloadHash } from '../missions.js';
 // Operations port contract
 // ---------------------------------------------------------------------------
 
-/** Stable downstream error taxonomy every port implementation must map into. */
+/**
+ * Stable downstream error taxonomy every port implementation must map into.
+ * 'invalid_response' is minted only by the Runtime itself when AutoPoster's
+ * response contradicts the request identity or the closed-world status
+ * contract — it is never adopted from a downstream body.
+ */
 export type AutoPosterPortErrorCode =
   | 'unauthorized'
   | 'forbidden'
   | 'not_found'
   | 'validation_failed'
   | 'unavailable'
+  | 'invalid_response'
   | 'internal';
 
 /**
@@ -149,12 +155,72 @@ export interface AutoPosterQueueListSuccess {
   scope: { accountId: string | 'all' };
 }
 
-export interface AutoPosterPostStatusView extends AutoPosterQueueItemView {
+/** Canonical AutoPoster queue lifecycle statuses (closed world; 'ready' is a legacy-but-accepted state). */
+export type AutoPosterQueueStatus =
+  | 'pending'
+  | 'scheduled'
+  | 'processing'
+  | 'ready'
+  | 'posted'
+  | 'failed'
+  | 'outcome_unknown';
+
+/**
+ * Bounded, sanitized subset of a job's lastResult. Exactly these keys are
+ * permitted — a provider response object, attempt payloads, or any other
+ * field fails the closed-world status parse.
+ */
+export interface AutoPosterPostStatusLastResultView {
+  mode?: string;
+  code?: string;
+  message?: string;
+  completedAt?: string;
+  willRetry?: boolean;
+  outcomeUnknown?: boolean;
+}
+
+/** One capped, scrubbed canonical evidence entry ({ at, event, detail } only). */
+export interface AutoPosterPostStatusHistoryEntryView {
+  at: string | null;
+  event: string;
+  detail: string;
+}
+
+/**
+ * Phase 2E-B strict post-status projection. Built exclusively by the
+ * closed-world parser in autoPosterHttpPort.ts: identity fields are byte
+ * exact, lifecycle evidence is bounded and allowlisted, and nothing outside
+ * this shape (raw provider payloads, lock ownership, media, captions,
+ * tokens) can pass through.
+ */
+export interface AutoPosterPostStatusView {
+  id: string;
+  provider: 'tiktok' | 'youtube';
+  connectedAccountId: string;
+  accountId: string;
+  username: string;
+  workspaceId: string;
+  status: AutoPosterQueueStatus;
+  scheduledAt: string | null;
+  approved: boolean;
+  approvalState: 'approved' | 'unapproved';
   approvedAt: string | null;
   approvedBy: string;
+  mediaType: string;
+  captionSummary: string;
+  createdAt: string | null;
+  updatedAt: string;
   postedAt: string | null;
   publishId: string;
+  providerStatus: string;
+  lockedAt: string | null;
   claimAttempts: number;
+  runtimeMissionId: string;
+  runtimeIdempotencyKey: string;
+  runtimeAction: string;
+  runtimePayloadHash: string;
+  lastResult: AutoPosterPostStatusLastResultView | null;
+  history: AutoPosterPostStatusHistoryEntryView[];
   lastErrorMessage: string;
 }
 

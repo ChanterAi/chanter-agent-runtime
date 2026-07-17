@@ -28,10 +28,14 @@ import type {
   AutoPosterCommercialDenialDetails,
   AutoPosterPortErrorCode,
   AutoPosterPortFailure,
+  AutoPosterPostStatusHistoryEntryView,
+  AutoPosterPostStatusLastResultView,
   AutoPosterPostStatusParams,
   AutoPosterPostStatusSuccess,
+  AutoPosterPostStatusView,
   AutoPosterQueueListParams,
   AutoPosterQueueListSuccess,
+  AutoPosterQueueStatus,
   AutoPosterScheduleParams,
   AutoPosterScheduleReconciliationParams,
   AutoPosterScheduleReconciliationSuccess,
@@ -271,6 +275,332 @@ function exactWorkspaceId(value: unknown): string | undefined {
   return typeof value === 'string' && Boolean(value) && value === value.trim() ? value : undefined;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2E-B closed-world post-status parser
+// ---------------------------------------------------------------------------
+
+const POST_STATUS_QUEUE_STATUSES = new Set<AutoPosterQueueStatus>([
+  'pending',
+  'scheduled',
+  'processing',
+  'ready',
+  'posted',
+  'failed',
+  'outcome_unknown',
+]);
+const POST_STATUS_HISTORY_LIMIT = 20;
+const POST_STATUS_LAST_RESULT_KEYS = new Set([
+  'mode',
+  'code',
+  'message',
+  'completedAt',
+  'willRetry',
+  'outcomeUnknown',
+]);
+const POST_STATUS_HISTORY_ENTRY_KEYS = new Set(['at', 'event', 'detail']);
+// Key names that must never appear anywhere in a status response body:
+// credential-shaped names, worker lock ownership, and raw media/content
+// fields. Exact-name checks come first; the pattern catches the rest.
+const POST_STATUS_FORBIDDEN_KEYS = new Set([
+  'lockedBy',
+  'caption',
+  'hashtags',
+  'mediaUrl',
+  'mediaPath',
+  'publicMediaUrl',
+  'publicImageUrl',
+  'videoPath',
+  'imagePath',
+]);
+const POST_STATUS_SECRET_KEY_PATTERN =
+  /token|secret|credential|password|authorization|api[-_]?key|cookie|bearer/i;
+
+type PostStatusParse =
+  | { ok: true; view: AutoPosterPostStatusView }
+  | { ok: false; message: string; identityMismatch: boolean };
+
+function statusParseError(message: string, identityMismatch = false): PostStatusParse {
+  return { ok: false, message, identityMismatch };
+}
+
+/** Recursively finds a forbidden or secret-like key anywhere in the response post. */
+function findUnsafeStatusKey(value: unknown, seen = new Set<object>()): string | undefined {
+  if (value === null || typeof value !== 'object') return undefined;
+  if (seen.has(value)) return undefined;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const unsafe = findUnsafeStatusKey(item, seen);
+      if (unsafe) return unsafe;
+    }
+    return undefined;
+  }
+  for (const [key, item] of Object.entries(value)) {
+    if (POST_STATUS_FORBIDDEN_KEYS.has(key) || POST_STATUS_SECRET_KEY_PATTERN.test(key)) {
+      return key;
+    }
+    const unsafe = findUnsafeStatusKey(item, seen);
+    if (unsafe) return unsafe;
+  }
+  return undefined;
+}
+
+function boundedString(value: unknown, maxLength: number): string | undefined {
+  if (typeof value !== 'string' || value.length > maxLength) return undefined;
+  // eslint-disable-next-line no-control-regex
+  return /[\u0000-\u001f\u007f]/.test(value) ? undefined : value;
+}
+
+/** null stays null; a string must be an exactly parseable timestamp and is kept byte-exact. */
+function timestampOrNull(value: unknown): string | null | undefined {
+  if (value === null) return null;
+  if (typeof value !== 'string' || !value || value.length > 80) return undefined;
+  return Number.isFinite(Date.parse(value)) ? value : undefined;
+}
+
+function parseStatusLastResult(
+  value: unknown
+): { value: AutoPosterPostStatusLastResultView | null } | { error: string } {
+  if (value === null || value === undefined) return { value: null };
+  const record = nonArrayRecord(value);
+  if (!record) return { error: 'lastResult is not an object' };
+  for (const key of Object.keys(record)) {
+    if (!POST_STATUS_LAST_RESULT_KEYS.has(key)) {
+      return { error: `lastResult contains the unexpected field "${redactText(key).slice(0, 40)}"` };
+    }
+  }
+  const view: AutoPosterPostStatusLastResultView = {};
+  for (const [key, maxLength] of [['mode', 40], ['code', 120], ['message', 300]] as const) {
+    if (record[key] !== undefined) {
+      const parsed = boundedString(record[key], maxLength);
+      if (parsed === undefined) return { error: `lastResult.${key} is malformed` };
+      view[key] = redactText(parsed);
+    }
+  }
+  if (record.completedAt !== undefined) {
+    const parsed = timestampOrNull(record.completedAt);
+    if (parsed === undefined || parsed === null) return { error: 'lastResult.completedAt is malformed' };
+    view.completedAt = parsed;
+  }
+  for (const key of ['willRetry', 'outcomeUnknown'] as const) {
+    if (record[key] !== undefined) {
+      if (typeof record[key] !== 'boolean') return { error: `lastResult.${key} is malformed` };
+      view[key] = record[key];
+    }
+  }
+  return { value: Object.keys(view).length > 0 ? view : null };
+}
+
+function parseStatusHistory(
+  value: unknown
+): { value: AutoPosterPostStatusHistoryEntryView[] } | { error: string } {
+  if (!Array.isArray(value)) return { error: 'history is not an array' };
+  if (value.length > POST_STATUS_HISTORY_LIMIT) {
+    return { error: `history exceeds the ${POST_STATUS_HISTORY_LIMIT}-entry wire cap` };
+  }
+  const entries: AutoPosterPostStatusHistoryEntryView[] = [];
+  for (const item of value) {
+    const record = nonArrayRecord(item);
+    if (!record) return { error: 'history contains a non-object entry' };
+    for (const key of Object.keys(record)) {
+      if (!POST_STATUS_HISTORY_ENTRY_KEYS.has(key)) {
+        return { error: `history contains the unexpected field "${redactText(key).slice(0, 40)}"` };
+      }
+    }
+    const event = boundedString(record.event, 64);
+    if (!event || !event.trim()) return { error: 'history contains an entry without a valid event' };
+    const at = record.at === undefined || record.at === null ? null : boundedString(record.at, 80);
+    if (at === undefined) return { error: 'history contains an entry with a malformed timestamp' };
+    const detail = record.detail === undefined ? '' : boundedString(record.detail, 300);
+    if (detail === undefined) return { error: 'history contains an entry with a malformed detail' };
+    entries.push({
+      at: at === null ? null : redactText(at),
+      event: redactText(event),
+      detail: redactText(detail),
+    });
+  }
+  return { value: entries };
+}
+
+/**
+ * Closed-world validation of one AutoPoster post-status response against the
+ * exact request identity. Every field the view carries is validated and
+ * copied explicitly — nothing is spread through — so unknown response fields
+ * can never reach a caller, and a contradiction fails typed instead of being
+ * silently normalized.
+ */
+function parsePostStatusView(value: unknown, params: AutoPosterPostStatusParams): PostStatusParse {
+  const post = nonArrayRecord(value);
+  if (!post) return statusParseError('AutoPoster returned a status response without a post object.');
+
+  const unsafeKey = findUnsafeStatusKey(post);
+  if (unsafeKey) {
+    return statusParseError(
+      `AutoPoster returned a status response containing the unsafe field "${redactText(unsafeKey).slice(0, 40)}".`
+    );
+  }
+
+  const id = boundedString(post.id, 256);
+  if (!id || !id.trim() || id !== id.trim()) {
+    return statusParseError('AutoPoster returned a status response without an exact post id.');
+  }
+  if (id !== params.postId) {
+    return statusParseError(
+      'AutoPoster returned status for a different post than the requested queue job id.',
+      true
+    );
+  }
+
+  const provider = post.provider;
+  if (provider !== 'tiktok' && provider !== 'youtube') {
+    return statusParseError('AutoPoster returned an unsupported or missing provider.');
+  }
+  const accountId = boundedString(post.accountId, 256);
+  if (!accountId || !accountId.trim() || accountId !== accountId.trim()) {
+    return statusParseError('AutoPoster returned a status response without an exact account id.');
+  }
+  if (params.accountId !== undefined && accountId !== params.accountId) {
+    return statusParseError(
+      'AutoPoster returned status for a different account than the requested scope.',
+      true
+    );
+  }
+  const connectedAccountId = boundedString(post.connectedAccountId, 512);
+  if (connectedAccountId === undefined || connectedAccountId !== `${provider}:${accountId}`) {
+    return statusParseError('AutoPoster returned a non-canonical connected-account identity.');
+  }
+  const workspaceId = boundedString(post.workspaceId, 160);
+  if (workspaceId === undefined || workspaceId !== workspaceId.trim()) {
+    return statusParseError('AutoPoster returned a malformed workspace identity.');
+  }
+  if (params.workspaceId !== undefined && workspaceId !== params.workspaceId) {
+    return statusParseError(
+      'AutoPoster returned status for a different workspace than the requested scope.',
+      true
+    );
+  }
+
+  const status = post.status;
+  if (typeof status !== 'string' || !POST_STATUS_QUEUE_STATUSES.has(status as AutoPosterQueueStatus)) {
+    return statusParseError('AutoPoster returned an unknown queue lifecycle status.');
+  }
+
+  const approved = post.approved;
+  const approvalState = post.approvalState;
+  const approvedAt = timestampOrNull(post.approvedAt ?? null);
+  const approvedBy = boundedString(post.approvedBy ?? '', 200);
+  if (
+    typeof approved !== 'boolean'
+    || (approvalState !== 'approved' && approvalState !== 'unapproved')
+    || approvedAt === undefined
+    || approvedBy === undefined
+  ) {
+    return statusParseError('AutoPoster returned malformed approval evidence.');
+  }
+  if (approved !== (approvalState === 'approved') || approved !== (approvedAt !== null)) {
+    return statusParseError('AutoPoster returned contradictory approval evidence.');
+  }
+  if (status === 'processing' && !approved) {
+    return statusParseError('AutoPoster returned a processing job without publish approval.');
+  }
+
+  const scheduledAt = timestampOrNull(post.scheduledAt ?? null);
+  const createdAt = timestampOrNull(post.createdAt ?? null);
+  const postedAt = timestampOrNull(post.postedAt ?? null);
+  const lockedAt = timestampOrNull(post.lockedAt ?? null);
+  if (
+    scheduledAt === undefined
+    || createdAt === undefined
+    || postedAt === undefined
+    || lockedAt === undefined
+  ) {
+    return statusParseError('AutoPoster returned a malformed lifecycle timestamp.');
+  }
+  const updatedAt = timestampOrNull(post.updatedAt ?? null);
+  if (updatedAt === undefined || updatedAt === null) {
+    return statusParseError('AutoPoster returned a status response without a valid source revision (updatedAt).');
+  }
+
+  const claimAttempts = post.claimAttempts;
+  if (!Number.isSafeInteger(claimAttempts) || (claimAttempts as number) < 0 || (claimAttempts as number) > 1000) {
+    return statusParseError('AutoPoster returned a malformed claim-attempt count.');
+  }
+
+  const publishId = boundedString(post.publishId ?? '', 500);
+  const providerStatus = boundedString(post.providerStatus ?? '', 120);
+  const mediaType = boundedString(post.mediaType ?? '', 40);
+  const username = boundedString(post.username ?? '', 200);
+  const captionSummary = boundedString(post.captionSummary ?? '', 200);
+  const lastErrorMessage = boundedString(post.lastErrorMessage ?? '', 300);
+  if (
+    publishId === undefined
+    || providerStatus === undefined
+    || mediaType === undefined
+    || username === undefined
+    || captionSummary === undefined
+    || lastErrorMessage === undefined
+  ) {
+    return statusParseError('AutoPoster returned a malformed status evidence field.');
+  }
+
+  const runtimeMissionId = boundedString(post.runtimeMissionId ?? '', 256);
+  const runtimeIdempotencyKey = boundedString(post.runtimeIdempotencyKey ?? '', 256);
+  const runtimeAction = boundedString(post.runtimeAction ?? '', 128);
+  const runtimePayloadHash = boundedString(post.runtimePayloadHash ?? '', 64);
+  if (
+    runtimeMissionId === undefined
+    || runtimeIdempotencyKey === undefined
+    || runtimeAction === undefined
+    || runtimePayloadHash === undefined
+    || (runtimePayloadHash !== '' && !/^[0-9a-f]{64}$/.test(runtimePayloadHash))
+  ) {
+    return statusParseError('AutoPoster returned malformed Runtime mission correlation metadata.');
+  }
+
+  const lastResult = parseStatusLastResult(post.lastResult ?? null);
+  if ('error' in lastResult) {
+    return statusParseError(`AutoPoster returned unsafe lastResult evidence: ${lastResult.error}.`);
+  }
+  const history = parseStatusHistory(post.history ?? []);
+  if ('error' in history) {
+    return statusParseError(`AutoPoster returned unsafe history evidence: ${history.error}.`);
+  }
+
+  return {
+    ok: true,
+    view: {
+      id,
+      provider,
+      connectedAccountId,
+      accountId,
+      username: redactText(username),
+      workspaceId,
+      status: status as AutoPosterQueueStatus,
+      scheduledAt,
+      approved,
+      approvalState,
+      approvedAt,
+      approvedBy: redactText(approvedBy),
+      mediaType,
+      captionSummary: redactText(captionSummary),
+      createdAt,
+      updatedAt,
+      postedAt,
+      publishId,
+      providerStatus,
+      lockedAt,
+      claimAttempts: claimAttempts as number,
+      runtimeMissionId,
+      runtimeIdempotencyKey,
+      runtimeAction,
+      runtimePayloadHash,
+      lastResult: lastResult.value,
+      history: history.value,
+      lastErrorMessage: redactText(lastErrorMessage),
+    },
+  };
+}
+
 /** Builds the real HTTP-backed operations port. Throws immediately on missing wiring — fail closed at construction. */
 export function createAutoPosterHttpPort(options: AutoPosterHttpPortOptions): AutoPosterOperationsPort {
   const baseUrl = options.baseUrl.replace(/\/+$/, '');
@@ -362,15 +692,26 @@ export function createAutoPosterHttpPort(options: AutoPosterHttpPortOptions): Au
       query.set('limit', String(params.limit));
       return call<AutoPosterQueueListSuccess>('GET', `/api/runtime/queue?${query.toString()}`);
     },
-    getPostStatus(params: AutoPosterPostStatusParams) {
+    async getPostStatus(params: AutoPosterPostStatusParams) {
       const query = new URLSearchParams();
       if (params.accountId) query.set('accountId', params.accountId);
       if (params.workspaceId) query.set('workspaceId', params.workspaceId);
       const suffix = query.size > 0 ? `?${query.toString()}` : '';
-      return call<AutoPosterPostStatusSuccess>(
+      const result = await call<{ ok: true; post?: unknown }>(
         'GET',
         `/api/runtime/posts/${encodeURIComponent(params.postId)}/status${suffix}`
       );
+      if (!result.ok) return result;
+
+      const parsed = parsePostStatusView(result.post, params);
+      if (!parsed.ok) {
+        return failure('invalid_response', parsed.message, {
+          reasonCode: parsed.identityMismatch
+            ? 'status_identity_mismatch'
+            : 'status_contract_violation',
+        });
+      }
+      return { ok: true, post: parsed.view } satisfies AutoPosterPostStatusSuccess;
     },
     validateMedia(params: AutoPosterMediaValidationParams) {
       return call<AutoPosterMediaValidationSuccess>('POST', '/api/runtime/media/validate', { ...params });

@@ -10,6 +10,7 @@ import {
   createAutoPosterHttpPort,
   RUNTIME_CONTROL_TOKEN_HEADER,
 } from '../../src/adapters/autoPosterHttpPort.js';
+import type { AutoPosterPostStatusParams } from '../../src/adapters/autoPosterMissionAdapter.js';
 
 const TOKEN = 'opaquecredentialvalue';
 
@@ -687,5 +688,278 @@ describe('createAutoPosterHttpPort — reachability and boundedness', () => {
     assert.equal(body.provider, 'youtube');
     assert.equal(body.title, 'Private launch teaser');
     assert.equal(body.description, 'Supervised test upload');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 2E-B strict post-status contract
+// ---------------------------------------------------------------------------
+
+function makeStatusPost(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: 'post-1',
+    provider: 'tiktok',
+    connectedAccountId: 'tiktok:account-a',
+    accountId: 'account-a',
+    username: 'creator_a',
+    workspaceId: 'workspace-a',
+    status: 'scheduled',
+    scheduledAt: '2026-07-11T09:00:00.000Z',
+    approved: false,
+    approvalState: 'unapproved',
+    approvedAt: null,
+    approvedBy: '',
+    mediaType: 'video',
+    captionSummary: 'First drop',
+    createdAt: '2026-07-10T08:00:00.000Z',
+    updatedAt: '2026-07-10T08:05:00.000Z',
+    postedAt: null,
+    publishId: '',
+    providerStatus: '',
+    lockedAt: null,
+    claimAttempts: 0,
+    runtimeMissionId: 'graph:g-1:node:n-1',
+    runtimeIdempotencyKey: 'graph:g-1:node:n-1',
+    runtimeAction: 'autoposter.post.schedule',
+    runtimePayloadHash: 'a'.repeat(64),
+    lastResult: null,
+    history: [],
+    lastErrorMessage: '',
+    ...overrides,
+  };
+}
+
+const APPROVED_FIELDS = {
+  approved: true,
+  approvalState: 'approved',
+  approvedAt: '2026-07-10T10:00:00.000Z',
+  approvedBy: 'founder@chanter',
+};
+
+function statusPortFor(post: unknown) {
+  const { fetchImpl, calls } = makeFetch(() => ({ status: 200, json: { ok: true, post } }));
+  return { port: makePort(fetchImpl), calls };
+}
+
+const STATUS_VIEW_KEYS = [
+  'accountId', 'approvalState', 'approved', 'approvedAt', 'approvedBy',
+  'captionSummary', 'claimAttempts', 'connectedAccountId', 'createdAt',
+  'history', 'id', 'lastErrorMessage', 'lastResult', 'lockedAt', 'mediaType',
+  'postedAt', 'provider', 'providerStatus', 'publishId', 'runtimeAction',
+  'runtimeIdempotencyKey', 'runtimeMissionId', 'runtimePayloadHash',
+  'scheduledAt', 'status', 'updatedAt', 'username', 'workspaceId',
+];
+
+describe('createAutoPosterHttpPort — strict post status parsing (Phase 2E-B)', () => {
+  it('parses every supported lifecycle state through the closed-world projection', async () => {
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ['scheduled unapproved draft', {}],
+      ['pending unapproved', { status: 'pending', scheduledAt: null }],
+      ['legacy ready', { status: 'ready', ...APPROVED_FIELDS }],
+      ['approved for publishing', APPROVED_FIELDS],
+      ['processing', {
+        ...APPROVED_FIELDS,
+        status: 'processing',
+        lockedAt: '2026-07-11T09:00:05.000Z',
+        claimAttempts: 1,
+      }],
+      ['retry scheduled', {
+        ...APPROVED_FIELDS,
+        claimAttempts: 2,
+        lastResult: { code: 'PROVIDER_5XX', message: 'HTTP 502 from provider.', willRetry: true },
+        history: [{ at: '2026-07-11T09:01:00.000Z', event: 'retry_scheduled', detail: 'Retrying in 5 minutes.' }],
+      }],
+      ['youtube uploaded private', {
+        ...APPROVED_FIELDS,
+        provider: 'youtube',
+        connectedAccountId: 'youtube:account-a',
+        status: 'posted',
+        postedAt: '2026-07-11T09:02:00.000Z',
+        publishId: 'yt-video-123',
+        providerStatus: 'uploaded_private',
+        lastResult: { completedAt: '2026-07-11T09:02:00.000Z' },
+      }],
+      ['tiktok provider accepted unverified', {
+        ...APPROVED_FIELDS,
+        status: 'posted',
+        postedAt: '2026-07-11T09:03:00.000Z',
+        publishId: 'tt-publish-9',
+        lastResult: { mode: 'api', completedAt: '2026-07-11T09:03:00.000Z' },
+      }],
+      ['manually reconciled', {
+        ...APPROVED_FIELDS,
+        status: 'posted',
+        postedAt: '2026-07-11T09:04:00.000Z',
+        lastResult: { mode: 'manual', message: 'Marked posted manually', completedAt: '2026-07-11T09:04:00.000Z' },
+        history: [{ at: '2026-07-11T09:04:00.000Z', event: 'marked_posted', detail: 'Human assertion.' }],
+      }],
+      ['failed', {
+        ...APPROVED_FIELDS,
+        status: 'failed',
+        claimAttempts: 3,
+        lastResult: { code: 'PROVIDER_AUTH', message: 'Reauthorize the account.' },
+        lastErrorMessage: 'Reauthorize the account.',
+      }],
+      ['outcome unknown', {
+        ...APPROVED_FIELDS,
+        status: 'outcome_unknown',
+        providerStatus: 'provider_reconciliation_required',
+        lastResult: { code: 'PROVIDER_RECONCILIATION_REQUIRED', outcomeUnknown: true },
+      }],
+    ];
+    for (const [label, overrides] of cases) {
+      const post = makeStatusPost(overrides);
+      const { port } = statusPortFor(post);
+      const result = await port.getPostStatus({
+        userId: 'owner',
+        workspaceId: 'workspace-a',
+        accountId: 'account-a',
+        postId: 'post-1',
+      });
+      assert.equal(result.ok, true, `${label}: ${JSON.stringify(!result.ok ? result.message : '')}`);
+      if (result.ok) {
+        assert.deepEqual(Object.keys(result.post).sort(), STATUS_VIEW_KEYS, label);
+        assert.equal(result.post.id, 'post-1', label);
+        assert.equal(result.post.status, post.status, label);
+        assert.equal(result.post.approved, post.approved, label);
+        assert.equal(result.post.updatedAt, '2026-07-10T08:05:00.000Z', label);
+      }
+    }
+  });
+
+  it('drops safe extra response fields (providerMetadata) without failing the parse', async () => {
+    const { port } = statusPortFor(makeStatusPost({
+      providerMetadata: { youtube: { title: 'Launch', description: '', privacyStatus: 'private', notifySubscribers: false } },
+    }));
+    const result = await port.getPostStatus({ userId: 'owner', postId: 'post-1' });
+    assert.equal(result.ok, true);
+    if (result.ok) {
+      assert.equal('providerMetadata' in result.post, false, 'unlisted fields never pass through');
+    }
+  });
+
+  it('rejects identity substitution with a typed identity mismatch', async () => {
+    const cases: Array<[string, Record<string, unknown>, AutoPosterPostStatusParams]> = [
+      ['different post id', {}, { userId: 'owner', postId: 'post-2' }],
+      ['account substitution', { accountId: 'account-b', connectedAccountId: 'tiktok:account-b' },
+        { userId: 'owner', postId: 'post-1', accountId: 'account-a' }],
+      ['workspace substitution', { workspaceId: 'workspace-b' },
+        { userId: 'owner', postId: 'post-1', workspaceId: 'workspace-a' }],
+      ['legacy empty workspace under a workspace-scoped read', { workspaceId: '' },
+        { userId: 'owner', postId: 'post-1', workspaceId: 'workspace-a' }],
+    ];
+    for (const [label, overrides, params] of cases) {
+      const { port } = statusPortFor(makeStatusPost(overrides));
+      const result = await port.getPostStatus(params);
+      assert.equal(result.ok, false, label);
+      if (!result.ok) {
+        assert.equal(result.code, 'invalid_response', label);
+        assert.equal(result.reasonCode, 'status_identity_mismatch', label);
+      }
+    }
+  });
+
+  it('fails closed on contract violations instead of normalizing them', async () => {
+    const legacyMinimalView = {
+      id: 'post-1',
+      accountId: 'account-a',
+      username: 'creator_a',
+      status: 'scheduled',
+      scheduledAt: '2026-07-11T09:00:00.000Z',
+      approved: false,
+      mediaType: 'video',
+      captionSummary: 'First drop',
+      createdAt: '2026-07-10T08:00:00.000Z',
+      updatedAt: '2026-07-10T08:05:00.000Z',
+      approvedAt: null,
+      approvedBy: '',
+      postedAt: null,
+      publishId: '',
+      claimAttempts: 0,
+      lastErrorMessage: '',
+    };
+    const cases: Array<[string, unknown]> = [
+      ['missing post object', undefined],
+      ['array post', []],
+      ['legacy minimal pre-2E-B view', legacyMinimalView],
+      ['unknown queue status', makeStatusPost({ status: 'publishing' })],
+      ['unsupported provider', makeStatusPost({ provider: 'instagram', connectedAccountId: 'instagram:account-a' })],
+      ['non-canonical connected account', makeStatusPost({ connectedAccountId: 'tiktok:other' })],
+      ['approval flag contradiction', makeStatusPost({ approved: true })],
+      ['approved without timestamp', makeStatusPost({ approved: true, approvalState: 'approved', approvedAt: null })],
+      ['processing without approval', makeStatusPost({ status: 'processing', lockedAt: '2026-07-11T09:00:05.000Z' })],
+      ['missing source revision', makeStatusPost({ updatedAt: null })],
+      ['malformed source revision', makeStatusPost({ updatedAt: 'not-a-date' })],
+      ['malformed posted timestamp', makeStatusPost({ postedAt: 'garbage' })],
+      ['negative claim attempts', makeStatusPost({ claimAttempts: -1 })],
+      ['fractional claim attempts', makeStatusPost({ claimAttempts: 1.5 })],
+      ['string claim attempts', makeStatusPost({ claimAttempts: '3' })],
+      ['non-array history', makeStatusPost({ history: 'log' })],
+      ['oversized history', makeStatusPost({
+        history: Array.from({ length: 21 }, (_, index) => ({ at: null, event: `event_${index}`, detail: '' })),
+      })],
+      ['history entry with unknown field', makeStatusPost({
+        history: [{ at: null, event: 'x', detail: '', raw: { body: 'payload' } }],
+      })],
+      ['history entry without event', makeStatusPost({ history: [{ at: null, detail: 'orphan' }] })],
+      ['lastResult with raw response', makeStatusPost({
+        lastResult: { code: 'OK', response: { publish_id: 'p' } },
+      })],
+      ['lastResult with unexpected attempts', makeStatusPost({ lastResult: { attempts: 2 } })],
+      ['malformed runtime payload hash', makeStatusPost({ runtimePayloadHash: 'Z'.repeat(64) })],
+    ];
+    for (const [label, post] of cases) {
+      const { port, calls } = statusPortFor(post);
+      const result = await port.getPostStatus({ userId: 'owner', postId: 'post-1' });
+      assert.equal(result.ok, false, label);
+      if (!result.ok) {
+        assert.equal(result.code, 'invalid_response', label);
+        assert.equal(result.reasonCode, 'status_contract_violation', label);
+      }
+      assert.equal(calls.length, 1, `${label}: a rejected response is never retried`);
+    }
+  });
+
+  it('rejects secret-like and unsafe fields anywhere in the response post', async () => {
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ['top-level lock ownership', { lockedBy: 'worker-1' }],
+      ['top-level media url', { mediaUrl: 'https://cdn.example.com/a.mp4' }],
+      ['top-level caption body', { caption: 'full caption' }],
+      ['secret-shaped key', { accessToken: 'value' }],
+      ['nested secret-shaped key', { debug: { refresh_token: 'value' } }],
+    ];
+    for (const [label, overrides] of cases) {
+      const { port } = statusPortFor(makeStatusPost(overrides));
+      const result = await port.getPostStatus({ userId: 'owner', postId: 'post-1' });
+      assert.equal(result.ok, false, label);
+      if (!result.ok) {
+        assert.equal(result.code, 'invalid_response', label);
+        assert.equal(result.message.includes('value'), false, `${label}: unsafe values never echo`);
+      }
+    }
+  });
+
+  it('redacts token-shaped content in human-readable evidence fields', async () => {
+    const { port } = statusPortFor(makeStatusPost({
+      status: 'failed',
+      ...APPROVED_FIELDS,
+      lastResult: { code: 'PROVIDER_AUTH', message: 'Bearer abc.def-ghi caused the refusal' },
+      lastErrorMessage: 'Bearer abc.def-ghi caused the refusal',
+      history: [{ at: null, event: 'failed', detail: 'API_KEY=super-secret-value refused' }],
+    }));
+    const result = await port.getPostStatus({ userId: 'owner', postId: 'post-1' });
+    assert.equal(result.ok, true);
+    if (result.ok) {
+      assert.equal(result.post.lastResult?.message?.includes('abc.def-ghi'), false);
+      assert.equal(result.post.lastErrorMessage.includes('abc.def-ghi'), false);
+      assert.equal(result.post.history[0]!.detail.includes('super-secret-value'), false);
+    }
+  });
+
+  it('a response echoing the service token stays an internal credential failure', async () => {
+    const { port } = statusPortFor(makeStatusPost({ publishId: TOKEN }));
+    const result = await port.getPostStatus({ userId: 'owner', postId: 'post-1' });
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.code, 'internal');
   });
 });
