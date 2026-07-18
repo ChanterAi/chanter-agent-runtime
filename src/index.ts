@@ -121,6 +121,45 @@ export {
   assertAgentRunLedgerExactReplay,
 } from './agentRunLedger.js';
 
+// ── Temporal Authority v1 contract and pure evaluation ──
+export type {
+  TemporalMissionPolicyV1,
+  TemporalAuthorizationV1,
+  TemporalTerminalReasonV1,
+  DurableTemporalStateV1,
+  TemporalReasonCodeV1,
+  TemporalAuthorityValidationIssueCode,
+  TemporalAuthorityValidationIssue,
+  TemporalStateRevisionV1,
+  TemporalCompletionContextV1,
+  TemporalClaimEvaluationInputV1,
+  TemporalCompletionEvaluationInputV1,
+  TemporalEligibilityEvaluationInputV1,
+  TemporalEligibleResultV1,
+  TemporalIneligibleResultV1,
+  TemporalEligibilityResultV1,
+  TemporalClock,
+  TemporalAuthorityFixturesV1,
+} from './temporalAuthority.js';
+export {
+  TEMPORAL_AUTHORITY_SCHEMA_VERSION,
+  TEMPORAL_POLICY_HASH_DOMAIN,
+  TEMPORAL_AUTHORITY_LIMITS,
+  TemporalAuthorityValidationError,
+  SystemTemporalClock,
+  FakeTemporalClock,
+  isCanonicalTemporalInstant,
+  validateCanonicalTemporalInstant,
+  validateTemporalMissionPolicyV1,
+  validateTemporalAuthorizationV1,
+  validateDurableTemporalStateV1,
+  canonicalizeTemporalAuthorityJson,
+  createTemporalPolicyBindingHash,
+  evaluateTemporalEligibilityV1,
+  TEMPORAL_AUTHORITY_FIXTURES_V1,
+  TEMPORAL_AUTHORITY_FIXTURES_V1_SERIALIZATION,
+} from './temporalAuthority.js';
+
 // ── Generic adapter contract ──
 export type {
   RuntimeAdapterInputEnvelope,

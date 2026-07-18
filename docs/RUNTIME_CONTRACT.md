@@ -301,3 +301,86 @@ The exact scope fields are `schema_version`, `run_id`, `product_id`, `workflow_i
 `production_impact`, and `source_subsystem`. Opaque identifiers and references are
 never trimmed or lowercased. Free text is redacted before hashing; secret-bearing
 opaque fields and signed credential URLs are rejected with typed validation errors.
+
+## 15. Temporal Authority v1 contract
+
+`src/temporalAuthority.ts` is the canonical additive Phase 1A vocabulary and pure
+evaluation surface. It does not schedule work, persist authority, acquire leases,
+increment attempts, approve an action, call a provider, or change any existing mission
+payload/idempotency hash.
+
+The three concerns remain separate readonly snapshots:
+
+- `TemporalMissionPolicyV1` uses `schemaVersion: "chanter.temporal.v1"`, canonical UTC
+  milliseconds, an absolute positive `maxAttempts` ceiling, and optional not-before,
+  deadline, execution-timeout, and lease-duration policy. Unknown fields fail closed.
+  `notBefore < submittedAt` is rejected; current Runtime compatibility provides no reason
+  to manufacture pre-submission authority.
+- `TemporalAuthorizationV1` transports one immutable authorization revision and expiry.
+  `authorizationVersion` is the authorization revision, not a schema discriminator. The
+  exported `V1` type is the contract version.
+- `DurableTemporalStateV1` carries mutable attempt, retry-not-before, lease, and terminal
+  vocabulary without turning Runtime into its durable owner. Lease fields are all-null or
+  fully populated. Terminal state preserves `deadline_exceeded` and
+  `attempt_budget_exhausted` as durable causes in addition to explicit success/failure;
+  subsequent evaluation maps every persisted non-success terminal cause to
+  `terminal_failure`, preventing wall-clock rollback from reopening eligibility. Snapshot validation proves
+  `0 <= attemptCount <= maxAttempts`; the Phase 1B durable owner must additionally enforce
+  cross-transition monotonicity atomically.
+
+All timestamps must round-trip exactly as `YYYY-MM-DDTHH:mm:ss.SSSZ`; local offsets,
+timezone-less strings, missing milliseconds, invalid calendar values, and noncanonical
+forms are rejected. Numeric policy values use the repository-wide safe-integer convention
+with their semantic positive/nonnegative minimum and no invented platform-scale maximum.
+Opaque identifiers reuse the Runtime's 256-character bound and secret/control-character
+checks.
+
+`createTemporalPolicyBindingHash(existingMissionPayloadHash, policy)` calculates lowercase
+SHA-256 over `chanter-temporal-policy-binding-v1\n` plus canonical key-sorted JSON containing
+the unchanged existing mission payload hash and the immutable policy. This binds content,
+ceiling, and temporal policy without changing operation identity.
+
+`TemporalClock` separates wall-clock observations (`nowInstant`) from process-local elapsed
+measurement (`monotonicNowMs`). `SystemTemporalClock` uses the system wall clock and
+`performance.now()`; `FakeTemporalClock` controls them independently for deterministic
+rollback/forward-jump tests. Raw monotonic values are never part of a contract, fixture,
+hash, or evaluator result and must never be persisted or compared across processes.
+
+`evaluateTemporalEligibilityV1` accepts a canonical explicit `evaluatedAt` and never reads a
+clock. Every result carries the evaluated instant, opaque durable `stateRevision`, current
+authorization id/version where present, attempt count/ceiling, and lease context. Eligible
+results use `{ eligible: true, reason: null }`; every ineligible or terminal result has
+exactly one closed Phase 1 reason.
+
+Claim-mode precedence is fixed and tested:
+
+1. terminal success/failure;
+2. deadline reached or passed;
+3. required authorization missing or bound to another payload/policy;
+4. authorization reached or passed its expiry;
+5. attempt ceiling reached;
+6. policy `notBefore` or durable `nextAttemptAt` still pending;
+7. live lease;
+8. eligible.
+
+`nextAttemptAt` remains mutable durable retry state, distinct from immutable policy, but both
+earliest-start gates use the closed `not_before_pending` decision because Phase 1 defines no
+second vague retry-delay reason. A lease is live only while `evaluatedAt < leaseExpiresAt`;
+equality is expired.
+
+Completion mode is deliberately separate from starting a claim. Terminal state still wins;
+otherwise the supplied owner, token, and one-based attempt must exactly match an unexpired
+durable lease or the result is `lease_lost`. A matching already-started attempt may be
+completed after approval/deadline expiry because those boundaries authorize attempt start,
+not retroactive cancellation. Completion mode does not perform the durable write or provider
+classification. `execution_timeout_before_mutation` and `provider_outcome_unknown` remain
+closed adapter vocabulary and are never emitted by the claim evaluator.
+
+Static valid and invalid examples are exported as `TEMPORAL_AUTHORITY_FIXTURES_V1`, with
+canonical byte-stable serialization in `TEMPORAL_AUTHORITY_FIXTURES_V1_SERIALIZATION`.
+Fixtures contain no current-time generation. Versioned inputs must be plain enumerable data
+objects. Validators copy verified data-descriptor values into exact frozen snapshots, so
+inherited, accessor, symbol, non-enumerable, or adversarial proxy getter values cannot
+influence evaluation while escaping canonical hashing. Caller-owned values are never frozen
+or mutated. Event sequence/causation remains the ordering authority; timestamps are
+observations, never causal tie-breakers.
