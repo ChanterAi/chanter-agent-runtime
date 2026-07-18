@@ -177,6 +177,8 @@ export interface AutoPosterPostStatusLastResultView {
   completedAt?: string;
   willRetry?: boolean;
   outcomeUnknown?: boolean;
+  providerMutationStarted?: boolean;
+  failureBoundary?: string;
 }
 
 /** One capped, scrubbed canonical evidence entry ({ at, event, detail } only). */
@@ -184,6 +186,21 @@ export interface AutoPosterPostStatusHistoryEntryView {
   at: string | null;
   event: string;
   detail: string;
+}
+
+/** Strict, secret-free YouTube resource verification produced by AutoPoster read-back. */
+export interface AutoPosterProviderVerificationView {
+  provider: 'youtube';
+  externalVideoId: string;
+  channelId: string;
+  channelTitle: string;
+  channelHandle: string;
+  title: string;
+  privacyStatus: 'private';
+  uploadStatus: string;
+  processingStatus: string;
+  verifiedAt: string;
+  uploadMethod: 'resumable';
 }
 
 /**
@@ -213,8 +230,11 @@ export interface AutoPosterPostStatusView {
   postedAt: string | null;
   publishId: string;
   providerStatus: string;
+  providerVerification: AutoPosterProviderVerificationView | null;
   lockedAt: string | null;
   claimAttempts: number;
+  publishAttemptBudget: number;
+  attemptBudgetExhausted: boolean;
   runtimeMissionId: string;
   runtimeIdempotencyKey: string;
   runtimeAction: string;

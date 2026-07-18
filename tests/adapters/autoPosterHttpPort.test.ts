@@ -716,8 +716,11 @@ function makeStatusPost(overrides: Record<string, unknown> = {}): Record<string,
     postedAt: null,
     publishId: '',
     providerStatus: '',
+    providerVerification: null,
     lockedAt: null,
     claimAttempts: 0,
+    publishAttemptBudget: 5,
+    attemptBudgetExhausted: false,
     runtimeMissionId: 'graph:g-1:node:n-1',
     runtimeIdempotencyKey: 'graph:g-1:node:n-1',
     runtimeAction: 'autoposter.post.schedule',
@@ -742,10 +745,10 @@ function statusPortFor(post: unknown) {
 }
 
 const STATUS_VIEW_KEYS = [
-  'accountId', 'approvalState', 'approved', 'approvedAt', 'approvedBy',
+  'accountId', 'approvalState', 'approved', 'approvedAt', 'approvedBy', 'attemptBudgetExhausted',
   'captionSummary', 'claimAttempts', 'connectedAccountId', 'createdAt',
   'history', 'id', 'lastErrorMessage', 'lastResult', 'lockedAt', 'mediaType',
-  'postedAt', 'provider', 'providerStatus', 'publishId', 'runtimeAction',
+  'postedAt', 'provider', 'providerStatus', 'providerVerification', 'publishAttemptBudget', 'publishId', 'runtimeAction',
   'runtimeIdempotencyKey', 'runtimeMissionId', 'runtimePayloadHash',
   'scheduledAt', 'status', 'updatedAt', 'username', 'workspaceId',
 ];
@@ -777,6 +780,19 @@ describe('createAutoPosterHttpPort — strict post status parsing (Phase 2E-B)',
         postedAt: '2026-07-11T09:02:00.000Z',
         publishId: 'yt-video-123',
         providerStatus: 'uploaded_private',
+        providerVerification: {
+          provider: 'youtube',
+          externalVideoId: 'yt-video-123',
+          channelId: 'account-a',
+          channelTitle: 'CHANTER',
+          channelHandle: '@chantercy',
+          title: 'CHANTER OS Real Provider Proof',
+          privacyStatus: 'private',
+          uploadStatus: 'uploaded',
+          processingStatus: 'processing',
+          verifiedAt: '2026-07-11T09:02:00.000Z',
+          uploadMethod: 'resumable',
+        },
         lastResult: { completedAt: '2026-07-11T09:02:00.000Z' },
       }],
       ['tiktok provider accepted unverified', {
@@ -797,7 +813,12 @@ describe('createAutoPosterHttpPort — strict post status parsing (Phase 2E-B)',
         ...APPROVED_FIELDS,
         status: 'failed',
         claimAttempts: 3,
-        lastResult: { code: 'PROVIDER_AUTH', message: 'Reauthorize the account.' },
+        lastResult: {
+          code: 'PROVIDER_AUTH',
+          message: 'Reauthorize the account.',
+          providerMutationStarted: false,
+          failureBoundary: 'before_provider_upload_session',
+        },
         lastErrorMessage: 'Reauthorize the account.',
       }],
       ['outcome unknown', {
@@ -825,6 +846,35 @@ describe('createAutoPosterHttpPort — strict post status parsing (Phase 2E-B)',
         assert.equal(result.post.updatedAt, '2026-07-10T08:05:00.000Z', label);
       }
     }
+  });
+
+  it('rejects provider verification that is not bound to the exact private YouTube artifact', async () => {
+    const base = {
+      ...APPROVED_FIELDS,
+      provider: 'youtube',
+      connectedAccountId: 'youtube:account-a',
+      status: 'posted',
+      postedAt: '2026-07-11T09:02:00.000Z',
+      publishId: 'yt-video-123',
+      providerStatus: 'uploaded_private',
+      providerVerification: {
+        provider: 'youtube',
+        externalVideoId: 'different-video',
+        channelId: 'account-a',
+        channelTitle: 'CHANTER',
+        channelHandle: '@chantercy',
+        title: 'CHANTER OS Real Provider Proof',
+        privacyStatus: 'private',
+        uploadStatus: 'uploaded',
+        processingStatus: 'succeeded',
+        verifiedAt: '2026-07-11T09:02:00.000Z',
+        uploadMethod: 'resumable',
+      },
+    };
+    const { port } = statusPortFor(makeStatusPost(base));
+    const result = await port.getPostStatus({ userId: 'owner', accountId: 'account-a', postId: 'post-1' });
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.match(result.message, /provider verification/i);
   });
 
   it('drops safe extra response fields (providerMetadata) without failing the parse', async () => {
@@ -894,6 +944,8 @@ describe('createAutoPosterHttpPort — strict post status parsing (Phase 2E-B)',
       ['negative claim attempts', makeStatusPost({ claimAttempts: -1 })],
       ['fractional claim attempts', makeStatusPost({ claimAttempts: 1.5 })],
       ['string claim attempts', makeStatusPost({ claimAttempts: '3' })],
+      ['missing publish attempt budget', makeStatusPost({ publishAttemptBudget: undefined })],
+      ['attempt budget contradiction', makeStatusPost({ claimAttempts: 5, attemptBudgetExhausted: false })],
       ['non-array history', makeStatusPost({ history: 'log' })],
       ['oversized history', makeStatusPost({
         history: Array.from({ length: 21 }, (_, index) => ({ at: null, event: `event_${index}`, detail: '' })),

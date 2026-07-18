@@ -28,6 +28,7 @@ import type {
   AutoPosterCommercialDenialDetails,
   AutoPosterPortErrorCode,
   AutoPosterPortFailure,
+  AutoPosterProviderVerificationView,
   AutoPosterPostStatusHistoryEntryView,
   AutoPosterPostStatusLastResultView,
   AutoPosterPostStatusParams,
@@ -296,8 +297,23 @@ const POST_STATUS_LAST_RESULT_KEYS = new Set([
   'completedAt',
   'willRetry',
   'outcomeUnknown',
+  'providerMutationStarted',
+  'failureBoundary',
 ]);
 const POST_STATUS_HISTORY_ENTRY_KEYS = new Set(['at', 'event', 'detail']);
+const PROVIDER_VERIFICATION_KEYS = new Set([
+  'provider',
+  'externalVideoId',
+  'channelId',
+  'channelTitle',
+  'channelHandle',
+  'title',
+  'privacyStatus',
+  'uploadStatus',
+  'processingStatus',
+  'verifiedAt',
+  'uploadMethod',
+]);
 // Key names that must never appear anywhere in a status response body:
 // credential-shaped names, worker lock ownership, and raw media/content
 // fields. Exact-name checks come first; the pattern catches the rest.
@@ -358,6 +374,64 @@ function timestampOrNull(value: unknown): string | null | undefined {
   return Number.isFinite(Date.parse(value)) ? value : undefined;
 }
 
+function parseProviderVerification(
+  value: unknown,
+  provider: 'tiktok' | 'youtube',
+  accountId: string,
+  publishId: string
+): { value: AutoPosterProviderVerificationView | null } | { error: string } {
+  if (value === null || value === undefined) return { value: null };
+  const record = nonArrayRecord(value);
+  if (!record) return { error: 'providerVerification is not an object' };
+  for (const key of Object.keys(record)) {
+    if (!PROVIDER_VERIFICATION_KEYS.has(key)) {
+      return { error: `providerVerification contains the unexpected field "${redactText(key).slice(0, 40)}"` };
+    }
+  }
+  if (provider !== 'youtube') return { error: 'providerVerification is only valid for YouTube jobs' };
+  const externalVideoId = boundedString(record.externalVideoId, 128);
+  const channelId = boundedString(record.channelId, 256);
+  const channelTitle = boundedString(record.channelTitle ?? '', 200);
+  const channelHandle = boundedString(record.channelHandle ?? '', 200);
+  const title = boundedString(record.title, 100);
+  const uploadStatus = boundedString(record.uploadStatus ?? '', 120);
+  const processingStatus = boundedString(record.processingStatus ?? '', 120);
+  const verifiedAt = timestampOrNull(record.verifiedAt);
+  if (
+    record.provider !== 'youtube'
+    || !externalVideoId
+    || externalVideoId !== publishId
+    || !channelId
+    || channelId !== accountId
+    || channelTitle === undefined
+    || channelHandle === undefined
+    || !title
+    || record.privacyStatus !== 'private'
+    || uploadStatus === undefined
+    || processingStatus === undefined
+    || verifiedAt === undefined
+    || verifiedAt === null
+    || record.uploadMethod !== 'resumable'
+  ) {
+    return { error: 'providerVerification does not match the exact YouTube artifact binding' };
+  }
+  return {
+    value: {
+      provider: 'youtube',
+      externalVideoId,
+      channelId,
+      channelTitle: redactText(channelTitle),
+      channelHandle: redactText(channelHandle),
+      title: redactText(title),
+      privacyStatus: 'private',
+      uploadStatus: redactText(uploadStatus),
+      processingStatus: redactText(processingStatus),
+      verifiedAt,
+      uploadMethod: 'resumable',
+    },
+  };
+}
+
 function parseStatusLastResult(
   value: unknown
 ): { value: AutoPosterPostStatusLastResultView | null } | { error: string } {
@@ -370,7 +444,12 @@ function parseStatusLastResult(
     }
   }
   const view: AutoPosterPostStatusLastResultView = {};
-  for (const [key, maxLength] of [['mode', 40], ['code', 120], ['message', 300]] as const) {
+  for (const [key, maxLength] of [
+    ['mode', 40],
+    ['code', 120],
+    ['message', 300],
+    ['failureBoundary', 120],
+  ] as const) {
     if (record[key] !== undefined) {
       const parsed = boundedString(record[key], maxLength);
       if (parsed === undefined) return { error: `lastResult.${key} is malformed` };
@@ -382,7 +461,7 @@ function parseStatusLastResult(
     if (parsed === undefined || parsed === null) return { error: 'lastResult.completedAt is malformed' };
     view.completedAt = parsed;
   }
-  for (const key of ['willRetry', 'outcomeUnknown'] as const) {
+  for (const key of ['willRetry', 'outcomeUnknown', 'providerMutationStarted'] as const) {
     if (record[key] !== undefined) {
       if (typeof record[key] !== 'boolean') return { error: `lastResult.${key} is malformed` };
       view[key] = record[key];
@@ -525,6 +604,17 @@ function parsePostStatusView(value: unknown, params: AutoPosterPostStatusParams)
   if (!Number.isSafeInteger(claimAttempts) || (claimAttempts as number) < 0 || (claimAttempts as number) > 1000) {
     return statusParseError('AutoPoster returned a malformed claim-attempt count.');
   }
+  const publishAttemptBudget = post.publishAttemptBudget;
+  const attemptBudgetExhausted = post.attemptBudgetExhausted;
+  if (
+    !Number.isSafeInteger(publishAttemptBudget)
+    || (publishAttemptBudget as number) < 0
+    || (publishAttemptBudget as number) > 1000
+    || typeof attemptBudgetExhausted !== 'boolean'
+    || attemptBudgetExhausted !== ((claimAttempts as number) >= (publishAttemptBudget as number))
+  ) {
+    return statusParseError('AutoPoster returned contradictory publish-attempt budget evidence.');
+  }
 
   const publishId = boundedString(post.publishId ?? '', 500);
   const providerStatus = boundedString(post.providerStatus ?? '', 120);
@@ -541,6 +631,16 @@ function parsePostStatusView(value: unknown, params: AutoPosterPostStatusParams)
     || lastErrorMessage === undefined
   ) {
     return statusParseError('AutoPoster returned a malformed status evidence field.');
+  }
+
+  const providerVerification = parseProviderVerification(
+    post.providerVerification ?? null,
+    provider,
+    accountId,
+    publishId
+  );
+  if ('error' in providerVerification) {
+    return statusParseError(`AutoPoster returned unsafe provider verification evidence: ${providerVerification.error}.`);
   }
 
   const runtimeMissionId = boundedString(post.runtimeMissionId ?? '', 256);
@@ -588,8 +688,11 @@ function parsePostStatusView(value: unknown, params: AutoPosterPostStatusParams)
       postedAt,
       publishId,
       providerStatus,
+      providerVerification: providerVerification.value,
       lockedAt,
       claimAttempts: claimAttempts as number,
+      publishAttemptBudget: publishAttemptBudget as number,
+      attemptBudgetExhausted,
       runtimeMissionId,
       runtimeIdempotencyKey,
       runtimeAction,
