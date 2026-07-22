@@ -80,6 +80,7 @@ function makeFakePort(overrides: Partial<AutoPosterOperationsPort> = {}): {
           publishId: '',
           providerStatus: '',
           providerVerification: null,
+          providerOperation: null,
           lockedAt: null,
           claimAttempts: 0,
           publishAttemptBudget: 5,
@@ -377,6 +378,51 @@ describe('autoposter.post.schedule', () => {
     assert.equal(params.provider, 'youtube');
     assert.equal(params.title, 'Private launch teaser');
     assert.equal(params.description, 'Supervised test upload');
+  });
+
+  it('approved-media identity and graph custody propagate exactly in provider-proof mode', async () => {
+    const approvedMedia = {
+      sha256: 'b'.repeat(64),
+      byteSize: 4096,
+      mimeType: 'video/mp4',
+      fileName: 'approved.mp4',
+      container: 'mp4',
+    } as const;
+    const { result, calls } = await run(
+      {},
+      approvedSchedule({
+        provider: 'youtube',
+        accountId: 'UC-chanter',
+        mediaUrl: 'https://cdn.example.com/approved.mp4',
+        scheduledAt: futureIso(),
+        title: 'Approved private proof',
+        graphId: 'graph-approved-proof',
+        providerProofMode: true,
+        approvedMedia,
+      }),
+    );
+    assert.equal(result.status, 'succeeded');
+    const params = calls.schedulePost[0] as Record<string, unknown>;
+    assert.equal(params.graphId, 'graph-approved-proof');
+    assert.equal(params.providerProofMode, true);
+    assert.deepEqual(params.approvedMedia, approvedMedia);
+    assert.equal(params.action, 'autoposter.post.schedule');
+    assert.match(String(params.missionPayloadHash), /^[a-f0-9]{64}$/);
+  });
+
+  it('provider-proof mode rejects incomplete or open-world media identity before the port', async () => {
+    for (const approvedMedia of [
+      { sha256: 'b'.repeat(64), byteSize: 4096, mimeType: 'video/mp4', fileName: 'approved.mp4' },
+      { sha256: 'b'.repeat(64), byteSize: 4096, mimeType: 'video/mp4', fileName: 'approved.mp4', container: 'mp4', extra: true },
+    ]) {
+      const { result, calls } = await run({}, approvedSchedule({
+        provider: 'youtube', accountId: 'UC-chanter', mediaUrl: 'https://cdn.example.com/approved.mp4',
+        scheduledAt: futureIso(), title: 'Approved private proof', graphId: 'graph-approved-proof',
+        providerProofMode: true, approvedMedia,
+      }));
+      assert.equal(result.status, 'validation_failed');
+      assert.equal(calls.schedulePost.length, 0);
+    }
   });
 
   it('a YouTube mission without a title fails before the port is called', async () => {

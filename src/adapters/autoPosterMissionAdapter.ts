@@ -203,6 +203,122 @@ export interface AutoPosterProviderVerificationView {
   uploadMethod: 'resumable';
 }
 
+export type AutoPosterProviderOperationState =
+  | 'operation_pending'
+  | 'media_preflighted'
+  | 'session_persisted'
+  | 'uploading'
+  | 'resumable'
+  | 'completed_private'
+  | 'provider_missing'
+  | 'contradictory_public'
+  | 'outcome_unknown'
+  | 'terminal_failure';
+
+export interface AutoPosterProviderMutationSummaryView {
+  providerSessionInitiationCount: number;
+  mediaUploadAttemptCount: number;
+  confirmedVideoArtifactCount: number;
+  existingResourceUpdateCount: number;
+  deleteCount: number;
+  reconciliationStatusReadCount: number;
+}
+
+export interface AutoPosterProviderStatusReceiptView {
+  provider: 'youtube';
+  queueId: string;
+  providerOperationId: string;
+  providerAttemptId: string;
+  userId: string;
+  workspaceId: string;
+  runtimeMissionId: string;
+  graphId: string;
+  mediaSha256: string;
+  approvedMedia: AutoPosterApprovedMediaIdentity | null;
+  providerProofMode: boolean;
+  configuredAccountId: string;
+  connectedAccountId: string;
+  verifiedChannelId: string;
+  authenticatedChannelId: string;
+  safeChannelTitle: string;
+  safeChannelHandle: string;
+  externalVideoId: string;
+  expectedTitle: string;
+  exactTitleMatch: boolean;
+  artifactExists: boolean;
+  privacyStatus: string;
+  uploadStatus: string;
+  processingStatus: string;
+  verificationMethod: 'youtube.videos.list+youtube.channels.list';
+  verificationTimestamp: string;
+  canonicalResponseSha256: string;
+}
+
+export interface AutoPosterApprovedMediaIdentity {
+  sha256: string;
+  byteSize: number;
+  mimeType: 'video/mp4';
+  fileName: string;
+  container: 'mp4';
+}
+
+export interface AutoPosterReconciliationLeaseView {
+  ownerId: string;
+  acquiredAt: string;
+  expiresAt: string;
+  attemptNumber: number;
+  operationId: string;
+  fencingToken: number;
+}
+
+/** Strict safe projection. The encrypted resumable-session locator is intentionally absent. */
+export interface AutoPosterProviderOperationView {
+  schemaVersion: 'chanter.autoposter.youtube-provider-operation.v1';
+  providerOperationId: string;
+  providerAttemptId: string;
+  provider: 'youtube';
+  operationState: AutoPosterProviderOperationState;
+  queueId: string;
+  userId: string;
+  workspaceId: string;
+  accountId: string;
+  connectedAccountId: string;
+  approvalActorId: string;
+  approvalTimestamp: string | null;
+  approvedAttemptNumber: number;
+  runtimeMissionId: string;
+  graphId: string;
+  runtimeAction: string;
+  runtimePayloadHash: string;
+  approvedMediaSha256: string | null;
+  providerProofMode: boolean;
+  approvedMedia: AutoPosterApprovedMediaIdentity | null;
+  bindingSha256: string | null;
+  mediaSha256: string | null;
+  mediaByteSize: number | null;
+  mediaMimeType: string | null;
+  mediaContainer: string | null;
+  mediaFileName: string | null;
+  mediaSourceId: string | null;
+  sessionCreatedAt: string | null;
+  uploadStartedAt: string | null;
+  uploadCompletedAt: string | null;
+  acceptedByteOffset: number;
+  externalVideoId: string | null;
+  providerResponseSha256: string | null;
+  providerStatusReceiptSha256: string | null;
+  providerStatusReceipt: AutoPosterProviderStatusReceiptView | null;
+  mutationSummary: AutoPosterProviderMutationSummaryView;
+  reconciliationAttemptCount: number;
+  reconciliationAttemptBudget: number;
+  reconciliationLease: AutoPosterReconciliationLeaseView | null;
+  reconciliationFencingToken: number;
+  lastReconciledAt: string | null;
+  lastOperationErrorCode: string | null;
+  eventCount: number;
+  eventDigestSha256: string;
+}
+
 /**
  * Phase 2E-B strict post-status projection. Built exclusively by the
  * closed-world parser in autoPosterHttpPort.ts: identity fields are byte
@@ -231,6 +347,7 @@ export interface AutoPosterPostStatusView {
   publishId: string;
   providerStatus: string;
   providerVerification: AutoPosterProviderVerificationView | null;
+  providerOperation: AutoPosterProviderOperationView | null;
   lockedAt: string | null;
   claimAttempts: number;
   publishAttemptBudget: number;
@@ -319,6 +436,30 @@ export interface AutoPosterPostStatusParams {
   accountId?: string;
 }
 
+export interface AutoPosterProviderReconciliationParams {
+  userId: string;
+  workspaceId?: string;
+  postId: string;
+  accountId: string;
+}
+
+export interface AutoPosterProviderReconciliationSuccess {
+  ok: true;
+  classification: AutoPosterProviderOperationState
+    | 'provider_operation_not_found'
+    | 'provider_operation_identity_mismatch'
+    | 'session_missing'
+    | 'budget_exhausted'
+    | 'session_locator_decrypt_failed'
+    | 'session_locator_invalid'
+    | 'provider_credentials_unavailable'
+    | 'media_unavailable'
+    | 'media_identity_drift'
+    | 'provider_status_unavailable'
+    | 'provider_receipt_rejected';
+  post: AutoPosterPostStatusView;
+}
+
 export interface AutoPosterMediaValidationParams {
   fileName?: string;
   mimeType?: string;
@@ -350,6 +491,9 @@ export interface AutoPosterScheduleParams {
   missionId?: string;
   action?: typeof AUTOPOSTER_ACTIONS.postSchedule;
   missionPayloadHash?: string;
+  graphId?: string;
+  providerProofMode?: boolean;
+  approvedMedia?: AutoPosterApprovedMediaIdentity;
 }
 
 export interface AutoPosterScheduleReconciliationParams {
@@ -373,6 +517,9 @@ export interface AutoPosterScheduleReconciliationParams {
 export interface AutoPosterOperationsPort {
   listQueue(params: AutoPosterQueueListParams): Promise<AutoPosterQueueListSuccess | AutoPosterPortFailure>;
   getPostStatus(params: AutoPosterPostStatusParams): Promise<AutoPosterPostStatusSuccess | AutoPosterPortFailure>;
+  reconcileProviderOperation?(
+    params: AutoPosterProviderReconciliationParams
+  ): Promise<AutoPosterProviderReconciliationSuccess | AutoPosterPortFailure>;
   validateMedia(
     params: AutoPosterMediaValidationParams
   ): Promise<AutoPosterMediaValidationSuccess | AutoPosterPortFailure>;
@@ -407,6 +554,27 @@ const QUEUE_LIST_DEFAULT_LIMIT = 25;
 
 function canonicalScheduleProviderScope(value: JsonValue | undefined): string {
   return value === undefined ? 'tiktok' : typeof value === 'string' ? value : '';
+}
+
+function approvedMediaInput(value: JsonValue | undefined): AutoPosterApprovedMediaIdentity | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const record = value as Record<string, JsonValue>;
+  const keys = Object.keys(record).sort();
+  if (keys.join(',') !== 'byteSize,container,fileName,mimeType,sha256') return null;
+  if (
+    typeof record.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(record.sha256)
+    || !Number.isSafeInteger(record.byteSize) || (record.byteSize as number) <= 0
+    || record.mimeType !== 'video/mp4' || record.container !== 'mp4'
+    || typeof record.fileName !== 'string' || !record.fileName || record.fileName.length > 255
+    || !/\.mp4$/i.test(record.fileName) || /[\\/<>:"|?*]/.test(record.fileName)
+  ) return null;
+  return {
+    sha256: record.sha256,
+    byteSize: record.byteSize as number,
+    mimeType: 'video/mp4',
+    fileName: record.fileName,
+    container: 'mp4',
+  };
 }
 
 function validateScheduleIdempotencyScope(request: RuntimeMissionRequest): RuntimeMissionError[] {
@@ -739,10 +907,25 @@ export function createAutoPosterMissionAdapter(port: AutoPosterOperationsPort): 
     const provider = typeof request.input.provider === 'string' ? request.input.provider : '';
     const title = asTrimmedString(request.input.title);
     const description = asTrimmedString(request.input.description);
+    const providerProofMode = request.input.providerProofMode === true;
+    const graphId = asTrimmedString(request.input.graphId);
+    const approvedMedia = approvedMediaInput(request.input.approvedMedia);
 
     if (!mediaUrl) errors.push({ code: 'MISSING_MEDIA_URL', message: 'mediaUrl is required for scheduling.' });
     if (provider === 'youtube' && !title) {
       errors.push({ code: 'MISSING_YOUTUBE_TITLE', message: 'title is required when provider is youtube.' });
+    }
+    if (request.input.providerProofMode !== undefined && typeof request.input.providerProofMode !== 'boolean') {
+      errors.push({ code: 'INVALID_PROVIDER_PROOF_MODE', message: 'providerProofMode must be a boolean.' });
+    }
+    if (providerProofMode && provider !== 'youtube') {
+      errors.push({ code: 'PROVIDER_PROOF_YOUTUBE_ONLY', message: 'providerProofMode is YouTube-only.' });
+    }
+    if (providerProofMode && (!approvedMedia || !graphId)) {
+      errors.push({ code: 'APPROVED_MEDIA_REQUIRED', message: 'Provider-proof mode requires exact graphId and approvedMedia identity.' });
+    }
+    if (!providerProofMode && request.input.approvedMedia !== undefined) {
+      errors.push({ code: 'APPROVED_MEDIA_MODE_REQUIRED', message: 'approvedMedia is accepted only in provider-proof mode.' });
     }
     if (!scheduledAtRaw) {
       errors.push({ code: 'MISSING_SCHEDULED_AT', message: 'scheduledAt is required for scheduling.' });
@@ -776,6 +959,8 @@ export function createAutoPosterMissionAdapter(port: AutoPosterOperationsPort): 
       missionId: request.missionId,
       action: AUTOPOSTER_ACTIONS.postSchedule,
       missionPayloadHash: createRuntimeMissionPayloadHash(request),
+      ...(graphId ? { graphId } : {}),
+      ...(providerProofMode ? { providerProofMode: true, approvedMedia: approvedMedia! } : {}),
     });
     if (!result.ok) return portFailureOutcome(AUTOPOSTER_ACTIONS.postSchedule, result);
     if (typeof result.duplicate !== 'boolean') {

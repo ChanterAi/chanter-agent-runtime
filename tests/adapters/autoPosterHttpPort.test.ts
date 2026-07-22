@@ -5,6 +5,7 @@
  */
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import { createHash } from 'node:crypto';
 
 import {
   createAutoPosterHttpPort,
@@ -106,6 +107,51 @@ describe('createAutoPosterHttpPort — wiring', () => {
       calls[1]!.url,
       'http://localhost:3010/api/runtime/posts/post-1/status?accountId=account-a&workspaceId=workspace-a'
     );
+  });
+});
+
+describe('createAutoPosterHttpPort - provider-operation reconciliation', () => {
+  const params = {
+    userId: 'owner', workspaceId: 'workspace-a', accountId: 'account-a', postId: 'post-1',
+  };
+  const reconciledPost = () => makeStatusPost({
+    ...APPROVED_FIELDS,
+    provider: 'youtube', connectedAccountId: 'youtube:account-a', status: 'posted',
+    postedAt: '2026-07-11T09:02:00.000Z', publishId: 'yt-video-123',
+    providerStatus: 'uploaded_private', providerVerification: makeProviderVerification(),
+    providerOperation: makeProviderOperation(),
+  });
+
+  it('makes one exact reconciliation POST with no internal retry', async () => {
+    const { fetchImpl, calls } = makeFetch(() => ({
+      status: 200,
+      json: { ok: true, classification: 'completed_private', post: reconciledPost() },
+    }));
+    const result = await makePort(fetchImpl).reconcileProviderOperation!(params);
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]!.method, 'POST');
+    assert.equal(calls[0]!.url, 'http://localhost:3010/api/runtime/posts/post-1/provider/reconcile');
+    assert.deepEqual(JSON.parse(calls[0]!.body!), { accountId: 'account-a', workspaceId: 'workspace-a' });
+  });
+
+  it('rejects malformed reconciliation envelopes after one call', async () => {
+    const { fetchImpl, calls } = makeFetch(() => ({
+      status: 200,
+      json: { ok: true, classification: 'invented_state', post: reconciledPost(), rawResponse: {} },
+    }));
+    const result = await makePort(fetchImpl).reconcileProviderOperation!(params);
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.code, 'invalid_response');
+    assert.equal(calls.length, 1);
+  });
+
+  it('maps a reconciliation timeout to unavailable without retrying', async () => {
+    const { fetchImpl, calls } = makeFetch(() => 'hang');
+    const result = await makePort(fetchImpl, 5).reconcileProviderOperation!(params);
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.code, 'unavailable');
+    assert.equal(calls.length, 1);
   });
 });
 
@@ -407,7 +453,7 @@ describe('createAutoPosterHttpPort — safe connected-account preflight', () => 
         assert.equal(result.details?.reasonCode, reasonCode);
         assert.equal(result.details?.accountId, 'CaseSensitive-OpenId');
         assert.equal(result.message.includes('abc123DEF456ghi789JKL012mno345PQR'), false);
-        assert.equal(result.message.includes('TOKEN=[REDACTED]'), true);
+        assert.equal(result.message.includes('withheld by the Runtime safety boundary'), true);
         assert.equal(JSON.stringify(result).includes('must-not-cross'), false);
       }
     }
@@ -679,6 +725,11 @@ describe('createAutoPosterHttpPort — reachability and boundedness', () => {
       hashtags: '',
       title: 'Private launch teaser',
       description: 'Supervised test upload',
+      graphId: 'graph-proof-10',
+      providerProofMode: true,
+      approvedMedia: {
+        sha256: 'b'.repeat(64), byteSize: 4096, mimeType: 'video/mp4', fileName: 'a.mp4', container: 'mp4',
+      },
       scheduledAt: '2099-07-11T09:00:00.000Z',
       idempotencyKey: 'idem-10',
       requestedBy: 'mcp-client',
@@ -688,6 +739,11 @@ describe('createAutoPosterHttpPort — reachability and boundedness', () => {
     assert.equal(body.provider, 'youtube');
     assert.equal(body.title, 'Private launch teaser');
     assert.equal(body.description, 'Supervised test upload');
+    assert.equal(body.graphId, 'graph-proof-10');
+    assert.equal(body.providerProofMode, true);
+    assert.deepEqual(body.approvedMedia, {
+      sha256: 'b'.repeat(64), byteSize: 4096, mimeType: 'video/mp4', fileName: 'a.mp4', container: 'mp4',
+    });
   });
 });
 
@@ -717,6 +773,7 @@ function makeStatusPost(overrides: Record<string, unknown> = {}): Record<string,
     publishId: '',
     providerStatus: '',
     providerVerification: null,
+    providerOperation: null,
     lockedAt: null,
     claimAttempts: 0,
     publishAttemptBudget: 5,
@@ -732,6 +789,67 @@ function makeStatusPost(overrides: Record<string, unknown> = {}): Record<string,
   };
 }
 
+function makeProviderOperation(
+  overrides: Record<string, unknown> = {},
+  receiptOverrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  const providerOperationId = `ytop_${'1'.repeat(64)}`;
+  const providerAttemptId = `ytatt_${'2'.repeat(64)}`;
+  const receipt = {
+    provider: 'youtube', queueId: 'post-1', providerOperationId, providerAttemptId,
+    userId: 'owner', workspaceId: 'workspace-a', runtimeMissionId: 'graph:g-1:node:n-1', graphId: 'g-1',
+    mediaSha256: '3'.repeat(64), configuredAccountId: 'account-a',
+    approvedMedia: null, providerProofMode: false,
+    connectedAccountId: 'youtube:account-a', verifiedChannelId: 'account-a',
+    authenticatedChannelId: 'account-a',
+    safeChannelTitle: 'CHANTER', safeChannelHandle: '@chanter', externalVideoId: 'yt-video-123',
+    expectedTitle: 'Exact private proof', exactTitleMatch: true, artifactExists: true,
+    privacyStatus: 'private', uploadStatus: 'processed', processingStatus: 'succeeded',
+    verificationMethod: 'youtube.videos.list+youtube.channels.list',
+    verificationTimestamp: '2026-07-11T09:02:00.000Z', canonicalResponseSha256: '4'.repeat(64),
+    ...receiptOverrides,
+  };
+  const canonicalize = (value: unknown): unknown => Array.isArray(value)
+    ? value.map(canonicalize)
+    : value && typeof value === 'object'
+      ? Object.fromEntries(Object.keys(value as Record<string, unknown>).sort().map((key) => [key, canonicalize((value as Record<string, unknown>)[key])]))
+      : value;
+  const receiptSha256 = createHash('sha256').update(JSON.stringify(canonicalize(receipt))).digest('hex');
+  return {
+    schemaVersion: 'chanter.autoposter.youtube-provider-operation.v1',
+    providerOperationId, providerAttemptId, provider: 'youtube', operationState: 'completed_private',
+    queueId: 'post-1', userId: 'owner', workspaceId: 'workspace-a', accountId: 'account-a',
+    connectedAccountId: 'youtube:account-a', runtimeMissionId: 'graph:g-1:node:n-1',
+    approvalActorId: 'founder@chanter', approvalTimestamp: '2026-07-10T10:00:00.000Z', approvedAttemptNumber: 1,
+    graphId: 'g-1', approvedMediaSha256: null, providerProofMode: false, approvedMedia: null,
+    runtimeAction: 'autoposter.post.schedule', runtimePayloadHash: 'a'.repeat(64),
+    bindingSha256: '5'.repeat(64), mediaSha256: '3'.repeat(64), mediaByteSize: 4096,
+    mediaMimeType: 'video/mp4', mediaContainer: 'mp4', mediaFileName: 'proof.mp4', mediaSourceId: `remote:${'6'.repeat(64)}`,
+    sessionCreatedAt: '2026-07-11T09:00:00.000Z', uploadStartedAt: '2026-07-11T09:00:01.000Z',
+    uploadCompletedAt: '2026-07-11T09:01:00.000Z', acceptedByteOffset: 4096,
+    externalVideoId: 'yt-video-123', providerResponseSha256: '7'.repeat(64),
+    providerStatusReceiptSha256: receiptSha256, providerStatusReceipt: receipt,
+    mutationSummary: {
+      providerSessionInitiationCount: 1, mediaUploadAttemptCount: 1, confirmedVideoArtifactCount: 1,
+      existingResourceUpdateCount: 0, deleteCount: 0, reconciliationStatusReadCount: 2,
+    },
+    reconciliationAttemptCount: 1, reconciliationAttemptBudget: 3,
+    reconciliationLease: null, reconciliationFencingToken: 0,
+    lastReconciledAt: '2026-07-11T09:02:00.000Z', lastOperationErrorCode: null,
+    eventCount: 8, eventDigestSha256: '9'.repeat(64),
+    ...overrides,
+  };
+}
+
+function makeProviderVerification(): Record<string, unknown> {
+  return {
+    provider: 'youtube', externalVideoId: 'yt-video-123', channelId: 'account-a',
+    channelTitle: 'CHANTER', channelHandle: '@chanter', title: 'Exact private proof',
+    privacyStatus: 'private', uploadStatus: 'processed', processingStatus: 'succeeded',
+    verifiedAt: '2026-07-11T09:02:00.000Z', uploadMethod: 'resumable',
+  };
+}
+
 const APPROVED_FIELDS = {
   approved: true,
   approvalState: 'approved',
@@ -744,16 +862,137 @@ function statusPortFor(post: unknown) {
   return { port: makePort(fetchImpl), calls };
 }
 
+async function parseCompletedPrivateStatus(
+  providerOperation: Record<string, unknown>,
+  providerVerification: Record<string, unknown> = makeProviderVerification(),
+) {
+  return statusPortFor(makeStatusPost({
+    ...APPROVED_FIELDS,
+    provider: 'youtube', connectedAccountId: 'youtube:account-a', status: 'posted',
+    postedAt: '2026-07-11T09:02:00.000Z', publishId: 'yt-video-123',
+    providerStatus: 'uploaded_private', providerVerification, providerOperation,
+  })).port.getPostStatus({
+    userId: 'owner', workspaceId: 'workspace-a', accountId: 'account-a', postId: 'post-1',
+  });
+}
+
 const STATUS_VIEW_KEYS = [
   'accountId', 'approvalState', 'approved', 'approvedAt', 'approvedBy', 'attemptBudgetExhausted',
   'captionSummary', 'claimAttempts', 'connectedAccountId', 'createdAt',
   'history', 'id', 'lastErrorMessage', 'lastResult', 'lockedAt', 'mediaType',
-  'postedAt', 'provider', 'providerStatus', 'providerVerification', 'publishAttemptBudget', 'publishId', 'runtimeAction',
+  'postedAt', 'provider', 'providerOperation', 'providerStatus', 'providerVerification', 'publishAttemptBudget', 'publishId', 'runtimeAction',
   'runtimeIdempotencyKey', 'runtimeMissionId', 'runtimePayloadHash',
   'scheduledAt', 'status', 'updatedAt', 'username', 'workspaceId',
 ];
 
 describe('createAutoPosterHttpPort — strict post status parsing (Phase 2E-B)', () => {
+  it('strictly parses the safe provider-operation envelope and preserves exact identity', async () => {
+    const post = makeStatusPost({
+      ...APPROVED_FIELDS,
+      provider: 'youtube', connectedAccountId: 'youtube:account-a', status: 'posted',
+      postedAt: '2026-07-11T09:02:00.000Z', publishId: 'yt-video-123',
+      providerStatus: 'uploaded_private', providerVerification: makeProviderVerification(),
+      providerOperation: makeProviderOperation(),
+    });
+    const result = await statusPortFor(post).port.getPostStatus({
+      userId: 'owner', workspaceId: 'workspace-a', accountId: 'account-a', postId: 'post-1',
+    });
+    assert.equal(result.ok, true, JSON.stringify(result));
+    if (result.ok) {
+      assert.equal(result.post.providerOperation?.providerOperationId, `ytop_${'1'.repeat(64)}`);
+      assert.equal(result.post.providerOperation?.providerStatusReceipt?.privacyStatus, 'private');
+      assert.equal(result.post.providerOperation?.mutationSummary.existingResourceUpdateCount, 0);
+      assert.equal(JSON.stringify(result).includes('sessionLocator'), false);
+    }
+  });
+
+  it('rejects completed_private when the canonical receipt upload status is rejected', async () => {
+    const result = await parseCompletedPrivateStatus(
+      makeProviderOperation({}, { uploadStatus: 'rejected' }),
+    );
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.code, 'invalid_response');
+  });
+
+  it('rejects completed_private when the canonical receipt processing status is failed', async () => {
+    const result = await parseCompletedPrivateStatus(
+      makeProviderOperation({}, { processingStatus: 'failed' }),
+    );
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.code, 'invalid_response');
+  });
+
+  it('rejects a failed canonical receipt even when providerVerification reports success', async () => {
+    const result = await parseCompletedPrivateStatus(
+      makeProviderOperation({}, { uploadStatus: 'failed', processingStatus: 'failed' }),
+      makeProviderVerification(),
+    );
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.code, 'invalid_response');
+  });
+
+  it('rejects successful canonical receipt statuses contradicted by failed providerVerification', async () => {
+    const result = await parseCompletedPrivateStatus(
+      makeProviderOperation(),
+      { ...makeProviderVerification(), processingStatus: 'failed' },
+    );
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.code, 'invalid_response');
+  });
+
+  it('rejects an unknown canonical receipt status instead of assuming success', async () => {
+    const result = await parseCompletedPrivateStatus(
+      makeProviderOperation({}, { uploadStatus: 'provider_mystery' }),
+    );
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.code, 'invalid_response');
+  });
+
+  it('rejects provider-operation identity mismatch, unknown receipt fields, and session URLs', async () => {
+    const baseReceipt = makeProviderOperation().providerStatusReceipt as Record<string, unknown>;
+    const cases = [
+      makeProviderOperation({ queueId: 'post-other' }),
+      makeProviderOperation({ providerStatusReceipt: { ...baseReceipt, rawResponse: {} } }),
+      makeProviderOperation({ lastOperationErrorCode: 'https://www.googleapis.com/upload/session?upload_id=secret' }),
+    ];
+    for (const providerOperation of cases) {
+      const result = await statusPortFor(makeStatusPost({
+        provider: 'youtube', connectedAccountId: 'youtube:account-a', providerOperation,
+      })).port.getPostStatus({ userId: 'owner', postId: 'post-1' });
+      assert.equal(result.ok, false);
+      if (!result.ok) assert.equal(result.code, 'invalid_response');
+    }
+  });
+
+  it('ADV-07/08 rejects every semantic terminal, identity, budget, offset, and proof contradiction', async () => {
+    const cases = [
+      makeProviderOperation({ externalVideoId: 'different-video' }),
+      makeProviderOperation({ operationState: 'completed_private', providerStatusReceipt: null, providerStatusReceiptSha256: null }),
+      makeProviderOperation({ operationState: 'contradictory_public' }),
+      makeProviderOperation({ operationState: 'provider_missing' }),
+      makeProviderOperation({ operationState: 'invented_terminal' }),
+      makeProviderOperation({ reconciliationAttemptCount: 4 }),
+      makeProviderOperation({ reconciliationAttemptBudget: 4 }),
+      makeProviderOperation({ acceptedByteOffset: 4097 }),
+      makeProviderOperation({ providerProofMode: true, approvedMediaSha256: '3'.repeat(64), approvedMedia: { sha256: '3'.repeat(64) } }),
+    ];
+    for (const providerOperation of cases) {
+      const result = await statusPortFor(makeStatusPost({
+        ...APPROVED_FIELDS,
+        provider: 'youtube', connectedAccountId: 'youtube:account-a', status: 'posted',
+        postedAt: '2026-07-11T09:02:00.000Z', publishId: 'yt-video-123',
+        providerStatus: 'uploaded_private', providerVerification: makeProviderVerification(),
+        providerOperation,
+      })).port.getPostStatus({ userId: 'owner', workspaceId: 'workspace-a', accountId: 'account-a', postId: 'post-1' });
+      assert.equal(result.ok, false, JSON.stringify(providerOperation));
+      if (!result.ok) assert.equal(result.code, 'invalid_response');
+    }
+    const missingWorkspace = await statusPortFor(makeStatusPost({ workspaceId: '' })).port.getPostStatus({
+      userId: 'owner', workspaceId: 'workspace-a', accountId: 'account-a', postId: 'post-1',
+    });
+    assert.equal(missingWorkspace.ok, false);
+  });
+
   it('parses every supported lifecycle state through the closed-world projection', async () => {
     const cases: Array<[string, Record<string, unknown>]> = [
       ['scheduled unapproved draft', {}],
@@ -877,15 +1116,13 @@ describe('createAutoPosterHttpPort — strict post status parsing (Phase 2E-B)',
     if (!result.ok) assert.match(result.message, /provider verification/i);
   });
 
-  it('drops safe extra response fields (providerMetadata) without failing the parse', async () => {
+  it('rejects unknown top-level response fields instead of silently dropping them', async () => {
     const { port } = statusPortFor(makeStatusPost({
       providerMetadata: { youtube: { title: 'Launch', description: '', privacyStatus: 'private', notifySubscribers: false } },
     }));
     const result = await port.getPostStatus({ userId: 'owner', postId: 'post-1' });
-    assert.equal(result.ok, true);
-    if (result.ok) {
-      assert.equal('providerMetadata' in result.post, false, 'unlisted fields never pass through');
-    }
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.code, 'invalid_response');
   });
 
   it('rejects identity substitution with a typed identity mismatch', async () => {
@@ -991,7 +1228,7 @@ describe('createAutoPosterHttpPort — strict post status parsing (Phase 2E-B)',
     }
   });
 
-  it('redacts token-shaped content in human-readable evidence fields', async () => {
+  it('rejects secret-like values even when they appear under otherwise allowed evidence keys', async () => {
     const { port } = statusPortFor(makeStatusPost({
       status: 'failed',
       ...APPROVED_FIELDS,
@@ -1000,11 +1237,10 @@ describe('createAutoPosterHttpPort — strict post status parsing (Phase 2E-B)',
       history: [{ at: null, event: 'failed', detail: 'API_KEY=super-secret-value refused' }],
     }));
     const result = await port.getPostStatus({ userId: 'owner', postId: 'post-1' });
-    assert.equal(result.ok, true);
-    if (result.ok) {
-      assert.equal(result.post.lastResult?.message?.includes('abc.def-ghi'), false);
-      assert.equal(result.post.lastErrorMessage.includes('abc.def-ghi'), false);
-      assert.equal(result.post.history[0]!.detail.includes('super-secret-value'), false);
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.code, 'invalid_response');
+      assert.equal(result.message.includes('abc.def-ghi'), false);
     }
   });
 

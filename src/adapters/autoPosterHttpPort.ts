@@ -28,6 +28,14 @@ import type {
   AutoPosterCommercialDenialDetails,
   AutoPosterPortErrorCode,
   AutoPosterPortFailure,
+  AutoPosterProviderMutationSummaryView,
+  AutoPosterApprovedMediaIdentity,
+  AutoPosterReconciliationLeaseView,
+  AutoPosterProviderOperationState,
+  AutoPosterProviderOperationView,
+  AutoPosterProviderReconciliationParams,
+  AutoPosterProviderReconciliationSuccess,
+  AutoPosterProviderStatusReceiptView,
   AutoPosterProviderVerificationView,
   AutoPosterPostStatusHistoryEntryView,
   AutoPosterPostStatusLastResultView,
@@ -43,6 +51,12 @@ import type {
   AutoPosterScheduleSuccess,
 } from './autoPosterMissionAdapter.js';
 import { redactText } from '../redaction.js';
+import { createHash } from 'node:crypto';
+import {
+  containsForbiddenProviderMaterial,
+  PROVIDER_DIAGNOSTIC_REDACTED_MESSAGE,
+  safeProviderFailureMessage,
+} from '../providerSafety.js';
 
 export interface AutoPosterHttpPortOptions {
   /** Base URL of the AutoPoster server, e.g. 'http://localhost:3010'. */
@@ -330,6 +344,24 @@ const POST_STATUS_FORBIDDEN_KEYS = new Set([
 ]);
 const POST_STATUS_SECRET_KEY_PATTERN =
   /token|secret|credential|password|authorization|api[-_]?key|cookie|bearer/i;
+const POST_STATUS_SECRET_VALUE_PATTERN =
+  /\bBearer\s+[A-Za-z0-9._~+\/-]+=*|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b|https?:\/\/[^\s"']*(?:upload_id=|\/upload-session\/|resumable)/i;
+const POST_STATUS_TOP_LEVEL_KEYS = new Set([
+  'id', 'provider', 'connectedAccountId', 'accountId', 'username', 'workspaceId', 'status',
+  'scheduledAt', 'approved', 'approvalState', 'approvedAt', 'approvedBy', 'mediaType',
+  'captionSummary', 'createdAt', 'updatedAt', 'postedAt', 'publishId', 'providerStatus',
+  'providerVerification', 'providerOperation', 'lockedAt', 'claimAttempts', 'publishAttemptBudget',
+  'attemptBudgetExhausted', 'runtimeMissionId', 'runtimeIdempotencyKey', 'runtimeAction',
+  'runtimePayloadHash', 'lastResult', 'history', 'lastErrorMessage',
+]);
+const PROVIDER_RECONCILIATION_CLASSIFICATIONS = new Set<AutoPosterProviderReconciliationSuccess['classification']>([
+  'operation_pending', 'media_preflighted', 'session_persisted', 'uploading', 'resumable',
+  'completed_private', 'provider_missing', 'contradictory_public', 'outcome_unknown', 'terminal_failure',
+  'provider_operation_not_found', 'provider_operation_identity_mismatch', 'session_missing',
+  'budget_exhausted', 'session_locator_decrypt_failed', 'session_locator_invalid',
+  'provider_credentials_unavailable', 'media_unavailable', 'media_identity_drift',
+  'provider_status_unavailable', 'provider_receipt_rejected',
+]);
 
 type PostStatusParse =
   | { ok: true; view: AutoPosterPostStatusView }
@@ -341,6 +373,7 @@ function statusParseError(message: string, identityMismatch = false): PostStatus
 
 /** Recursively finds a forbidden or secret-like key anywhere in the response post. */
 function findUnsafeStatusKey(value: unknown, seen = new Set<object>()): string | undefined {
+  if (typeof value === 'string' && POST_STATUS_SECRET_VALUE_PATTERN.test(value)) return '[secret-like value]';
   if (value === null || typeof value !== 'object') return undefined;
   if (seen.has(value)) return undefined;
   seen.add(value);
@@ -352,7 +385,9 @@ function findUnsafeStatusKey(value: unknown, seen = new Set<object>()): string |
     return undefined;
   }
   for (const [key, item] of Object.entries(value)) {
-    if (POST_STATUS_FORBIDDEN_KEYS.has(key) || POST_STATUS_SECRET_KEY_PATTERN.test(key)) {
+    if (POST_STATUS_FORBIDDEN_KEYS.has(key) || (
+      key !== 'reconciliationFencingToken' && POST_STATUS_SECRET_KEY_PATTERN.test(key)
+    )) {
       return key;
     }
     const unsafe = findUnsafeStatusKey(item, seen);
@@ -501,6 +536,432 @@ function parseStatusHistory(
   return { value: entries };
 }
 
+const SHA256_PATTERN = /^[a-f0-9]{64}$/;
+const PROVIDER_OPERATION_ID_PATTERN = /^ytop_[a-f0-9]{64}$/;
+const PROVIDER_ATTEMPT_ID_PATTERN = /^ytatt_[a-f0-9]{64}$/;
+const PROVIDER_OPERATION_STATES = new Set<AutoPosterProviderOperationState>([
+  'operation_pending', 'media_preflighted', 'session_persisted', 'uploading', 'resumable',
+  'completed_private', 'provider_missing', 'contradictory_public', 'outcome_unknown', 'terminal_failure',
+]);
+const PROVIDER_OPERATION_KEYS = new Set([
+  'schemaVersion', 'providerOperationId', 'providerAttemptId', 'provider', 'operationState',
+  'queueId', 'userId', 'workspaceId', 'accountId', 'connectedAccountId', 'approvalActorId',
+  'approvalTimestamp', 'approvedAttemptNumber', 'runtimeMissionId', 'graphId', 'runtimeAction',
+  'runtimePayloadHash', 'approvedMediaSha256', 'providerProofMode', 'approvedMedia',
+  'bindingSha256', 'mediaSha256', 'mediaByteSize', 'mediaMimeType', 'mediaContainer',
+  'mediaFileName', 'mediaSourceId', 'sessionCreatedAt', 'uploadStartedAt', 'uploadCompletedAt',
+  'acceptedByteOffset', 'externalVideoId', 'providerResponseSha256', 'providerStatusReceiptSha256',
+  'providerStatusReceipt', 'mutationSummary', 'reconciliationAttemptCount',
+  'reconciliationAttemptBudget', 'reconciliationLease', 'reconciliationFencingToken',
+  'lastReconciledAt', 'lastOperationErrorCode', 'eventCount',
+  'eventDigestSha256',
+]);
+const PROVIDER_MUTATION_KEYS = new Set([
+  'providerSessionInitiationCount', 'mediaUploadAttemptCount', 'confirmedVideoArtifactCount',
+  'existingResourceUpdateCount', 'deleteCount', 'reconciliationStatusReadCount',
+]);
+const PROVIDER_RECEIPT_KEYS = new Set([
+  'provider', 'queueId', 'providerOperationId', 'providerAttemptId', 'userId', 'workspaceId',
+  'runtimeMissionId', 'graphId', 'mediaSha256', 'approvedMedia', 'providerProofMode',
+  'configuredAccountId', 'connectedAccountId', 'verifiedChannelId', 'safeChannelTitle',
+  'authenticatedChannelId',
+  'safeChannelHandle', 'externalVideoId', 'expectedTitle', 'exactTitleMatch', 'artifactExists',
+  'privacyStatus', 'uploadStatus', 'processingStatus', 'verificationMethod',
+  'verificationTimestamp', 'canonicalResponseSha256',
+]);
+const COMPLETED_PRIVATE_UPLOAD_SUCCESS_STATUSES = new Set(['processed']);
+const COMPLETED_PRIVATE_PROCESSING_SUCCESS_STATUSES = new Set(['succeeded']);
+
+function normalizeProviderStatus(status: string): string {
+  return status.trim().toLowerCase();
+}
+
+function completedPrivateStatusesAreCoherent(
+  receipt: Pick<AutoPosterProviderStatusReceiptView, 'uploadStatus' | 'processingStatus'>,
+  verification?: Pick<AutoPosterProviderVerificationView, 'uploadStatus' | 'processingStatus'>,
+): boolean {
+  const receiptUploadStatus = normalizeProviderStatus(receipt.uploadStatus);
+  const receiptProcessingStatus = normalizeProviderStatus(receipt.processingStatus);
+  if (
+    !COMPLETED_PRIVATE_UPLOAD_SUCCESS_STATUSES.has(receiptUploadStatus)
+    || !COMPLETED_PRIVATE_PROCESSING_SUCCESS_STATUSES.has(receiptProcessingStatus)
+  ) return false;
+  if (!verification) return true;
+  return normalizeProviderStatus(verification.uploadStatus) === receiptUploadStatus
+    && normalizeProviderStatus(verification.processingStatus) === receiptProcessingStatus;
+}
+
+function hasOnlyKeys(record: Record<string, unknown>, allowed: Set<string>): boolean {
+  return Object.keys(record).every((key) => allowed.has(key));
+}
+
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.keys(value as Record<string, unknown>).sort().map((key) => [
+    key,
+    canonicalize((value as Record<string, unknown>)[key]),
+  ]));
+}
+
+function canonicalSha256(value: unknown): string {
+  return createHash('sha256').update(JSON.stringify(canonicalize(value))).digest('hex');
+}
+
+function safeCount(value: unknown, maximum = 100_000): number | undefined {
+  return Number.isSafeInteger(value) && (value as number) >= 0 && (value as number) <= maximum
+    ? value as number
+    : undefined;
+}
+
+const APPROVED_MEDIA_KEYS = new Set(['sha256', 'byteSize', 'mimeType', 'fileName', 'container']);
+function parseApprovedMedia(value: unknown): AutoPosterApprovedMediaIdentity | null | undefined {
+  if (value === null) return null;
+  const record = nonArrayRecord(value);
+  if (!record || !hasOnlyKeys(record, APPROVED_MEDIA_KEYS) || Object.keys(record).length !== APPROVED_MEDIA_KEYS.size) {
+    return undefined;
+  }
+  const fileName = boundedString(record.fileName, 255);
+  if (
+    typeof record.sha256 !== 'string' || !SHA256_PATTERN.test(record.sha256)
+    || !Number.isSafeInteger(record.byteSize) || (record.byteSize as number) <= 0
+    || record.mimeType !== 'video/mp4' || record.container !== 'mp4'
+    || !fileName || !/\.mp4$/i.test(fileName) || /[\\/<>:"|?*]/.test(fileName)
+  ) return undefined;
+  return {
+    sha256: record.sha256,
+    byteSize: record.byteSize as number,
+    mimeType: 'video/mp4',
+    fileName,
+    container: 'mp4',
+  };
+}
+
+function parseReconciliationLease(
+  value: unknown,
+  operationId: string,
+): AutoPosterReconciliationLeaseView | null | undefined {
+  if (value === null) return null;
+  const record = nonArrayRecord(value);
+  if (!record || !hasOnlyKeys(record, new Set([
+    'ownerId', 'acquiredAt', 'expiresAt', 'attemptNumber', 'operationId', 'fencingToken',
+  ]))) return undefined;
+  const ownerId = boundedString(record.ownerId, 256);
+  const acquiredAt = timestampOrNull(record.acquiredAt);
+  const expiresAt = timestampOrNull(record.expiresAt);
+  const attemptNumber = safeCount(record.attemptNumber, 3);
+  const fencingToken = safeCount(record.fencingToken, Number.MAX_SAFE_INTEGER);
+  if (!ownerId || !acquiredAt || !expiresAt || Date.parse(expiresAt) <= Date.parse(acquiredAt)
+    || !attemptNumber || !fencingToken || record.operationId !== operationId) return undefined;
+  return { ownerId, acquiredAt, expiresAt, attemptNumber, operationId, fencingToken };
+}
+
+function parseProviderMutationSummary(value: unknown): AutoPosterProviderMutationSummaryView | undefined {
+  const record = nonArrayRecord(value);
+  if (!record || !hasOnlyKeys(record, PROVIDER_MUTATION_KEYS)) return undefined;
+  const result = {} as AutoPosterProviderMutationSummaryView;
+  for (const key of PROVIDER_MUTATION_KEYS as Set<keyof AutoPosterProviderMutationSummaryView>) {
+    const count = safeCount(record[key]);
+    if (count === undefined) return undefined;
+    result[key] = count;
+  }
+  return result;
+}
+
+function parseProviderReceipt(
+  value: unknown,
+  identity: {
+    queueId: string;
+    providerOperationId: string;
+    providerAttemptId: string;
+    mediaSha256: string;
+    approvedMedia: AutoPosterApprovedMediaIdentity | null;
+    providerProofMode: boolean;
+    userId: string;
+    workspaceId: string;
+    runtimeMissionId: string;
+    graphId: string;
+    accountId: string;
+    connectedAccountId: string;
+  }
+): AutoPosterProviderStatusReceiptView | undefined {
+  const record = nonArrayRecord(value);
+  if (!record || !hasOnlyKeys(record, PROVIDER_RECEIPT_KEYS)) return undefined;
+  const expectedTitle = boundedString(record.expectedTitle, 100);
+  const verifiedChannelId = boundedString(record.verifiedChannelId, 256);
+  const externalVideoId = boundedString(record.externalVideoId, 128);
+  const safeChannelTitle = boundedString(record.safeChannelTitle, 200);
+  const safeChannelHandle = boundedString(record.safeChannelHandle, 200);
+  const privacyStatus = boundedString(record.privacyStatus, 40);
+  const uploadStatus = boundedString(record.uploadStatus, 120);
+  const processingStatus = boundedString(record.processingStatus, 120);
+  const verificationTimestamp = timestampOrNull(record.verificationTimestamp);
+  const artifactExists = record.artifactExists;
+  const approvedMedia = parseApprovedMedia(record.approvedMedia ?? null);
+  const providerProofMode = record.providerProofMode === true;
+  if (
+    record.provider !== 'youtube'
+    || record.queueId !== identity.queueId
+    || record.providerOperationId !== identity.providerOperationId
+    || record.providerAttemptId !== identity.providerAttemptId
+    || record.mediaSha256 !== identity.mediaSha256
+    || record.userId !== identity.userId
+    || record.workspaceId !== identity.workspaceId
+    || record.runtimeMissionId !== identity.runtimeMissionId
+    || record.graphId !== identity.graphId
+    || approvedMedia === undefined
+    || providerProofMode !== identity.providerProofMode
+    || JSON.stringify(approvedMedia) !== JSON.stringify(identity.approvedMedia)
+    || record.configuredAccountId !== identity.accountId
+    || record.connectedAccountId !== identity.connectedAccountId
+    || record.authenticatedChannelId !== record.verifiedChannelId
+    || record.verificationMethod !== 'youtube.videos.list+youtube.channels.list'
+    || typeof record.exactTitleMatch !== 'boolean'
+    || typeof artifactExists !== 'boolean'
+    || !expectedTitle
+    || verifiedChannelId === undefined
+    || externalVideoId === undefined
+    || safeChannelTitle === undefined
+    || safeChannelHandle === undefined
+    || privacyStatus === undefined
+    || uploadStatus === undefined
+    || processingStatus === undefined
+    || verificationTimestamp === undefined
+    || verificationTimestamp === null
+    || typeof record.canonicalResponseSha256 !== 'string'
+    || !SHA256_PATTERN.test(record.canonicalResponseSha256)
+    || (artifactExists && (!verifiedChannelId || !externalVideoId))
+  ) return undefined;
+  return {
+    provider: 'youtube',
+    queueId: identity.queueId,
+    providerOperationId: identity.providerOperationId,
+    providerAttemptId: identity.providerAttemptId,
+    mediaSha256: identity.mediaSha256,
+    userId: identity.userId,
+    workspaceId: identity.workspaceId,
+    runtimeMissionId: identity.runtimeMissionId,
+    graphId: identity.graphId,
+    approvedMedia,
+    providerProofMode,
+    configuredAccountId: identity.accountId,
+    connectedAccountId: identity.connectedAccountId,
+    verifiedChannelId,
+    authenticatedChannelId: verifiedChannelId,
+    safeChannelTitle: redactText(safeChannelTitle),
+    safeChannelHandle: redactText(safeChannelHandle),
+    externalVideoId,
+    expectedTitle: redactText(expectedTitle),
+    exactTitleMatch: record.exactTitleMatch,
+    artifactExists,
+    privacyStatus,
+    uploadStatus: redactText(uploadStatus),
+    processingStatus: redactText(processingStatus),
+    verificationMethod: 'youtube.videos.list+youtube.channels.list',
+    verificationTimestamp,
+    canonicalResponseSha256: record.canonicalResponseSha256,
+  };
+}
+
+function parseProviderOperation(
+  value: unknown,
+  post: {
+    id: string;
+    provider: 'tiktok' | 'youtube';
+    workspaceId: string;
+    accountId: string;
+    connectedAccountId: string;
+    runtimeMissionId: string;
+    runtimeAction: string;
+    runtimePayloadHash: string;
+    userId: string;
+  }
+): { value: AutoPosterProviderOperationView | null } | { error: string } {
+  if (value === null || value === undefined) return { value: null };
+  const record = nonArrayRecord(value);
+  if (!record || !hasOnlyKeys(record, PROVIDER_OPERATION_KEYS)) {
+    return { error: 'providerOperation contains an unknown field or is not an object' };
+  }
+  const providerOperationId = boundedString(record.providerOperationId, 96);
+  const providerAttemptId = boundedString(record.providerAttemptId, 96);
+  const operationState = record.operationState;
+  const graphId = boundedString(record.graphId ?? '', 256);
+  const approvalActorId = boundedString(record.approvalActorId, 256);
+  const approvalTimestamp = timestampOrNull(record.approvalTimestamp);
+  const approvedAttemptNumber = safeCount(record.approvedAttemptNumber, 1000);
+  if (
+    post.provider !== 'youtube'
+    || record.schemaVersion !== 'chanter.autoposter.youtube-provider-operation.v1'
+    || record.provider !== 'youtube'
+    || !providerOperationId || !PROVIDER_OPERATION_ID_PATTERN.test(providerOperationId)
+    || !providerAttemptId || !PROVIDER_ATTEMPT_ID_PATTERN.test(providerAttemptId)
+    || typeof operationState !== 'string'
+    || !PROVIDER_OPERATION_STATES.has(operationState as AutoPosterProviderOperationState)
+    || record.queueId !== post.id
+    || record.userId !== post.userId
+    || record.workspaceId !== post.workspaceId
+    || record.accountId !== post.accountId
+    || record.connectedAccountId !== post.connectedAccountId
+    || record.runtimeMissionId !== post.runtimeMissionId
+    || record.runtimeAction !== post.runtimeAction
+    || record.runtimePayloadHash !== post.runtimePayloadHash
+    || graphId === undefined
+    || !approvalActorId
+    || !approvalTimestamp
+    || !approvedAttemptNumber
+  ) return { error: 'providerOperation does not match the exact post identity' };
+
+  const nullableHash = (candidate: unknown): string | null | undefined => (
+    candidate === null ? null : typeof candidate === 'string' && SHA256_PATTERN.test(candidate) ? candidate : undefined
+  );
+  const bindingSha256 = nullableHash(record.bindingSha256);
+  const approvedMediaSha256 = nullableHash(record.approvedMediaSha256);
+  const approvedMedia = parseApprovedMedia(record.approvedMedia ?? null);
+  const providerProofMode = record.providerProofMode === true;
+  const mediaSha256 = nullableHash(record.mediaSha256);
+  const providerResponseSha256 = nullableHash(record.providerResponseSha256);
+  const providerStatusReceiptSha256 = nullableHash(record.providerStatusReceiptSha256);
+  const mediaByteSize = record.mediaByteSize === null
+    ? null
+    : safeCount(record.mediaByteSize, Number.MAX_SAFE_INTEGER);
+  const mediaMimeType = record.mediaMimeType === null ? null : boundedString(record.mediaMimeType, 120);
+  const mediaContainer = record.mediaContainer === null ? null : boundedString(record.mediaContainer, 24);
+  const mediaFileName = record.mediaFileName === null ? null : boundedString(record.mediaFileName, 255);
+  const mediaSourceId = record.mediaSourceId === null ? null : boundedString(record.mediaSourceId, 512);
+  const mediaFields = [bindingSha256, mediaSha256, mediaByteSize, mediaMimeType, mediaContainer, mediaFileName, mediaSourceId];
+  const hasMedia = mediaFields.every((item) => item !== null && item !== undefined);
+  const noMedia = mediaFields.every((item) => item === null);
+  if (
+    bindingSha256 === undefined || approvedMediaSha256 === undefined || approvedMedia === undefined
+    || mediaSha256 === undefined || mediaByteSize === undefined
+    || mediaMimeType === undefined || mediaContainer === undefined || mediaFileName === undefined || mediaSourceId === undefined
+    || (!hasMedia && !noMedia)
+    || (hasMedia && (!(mediaByteSize as number) || mediaMimeType !== 'video/mp4' || mediaContainer !== 'mp4'))
+    || (providerProofMode && (!approvedMedia || approvedMediaSha256 !== approvedMedia.sha256))
+    || (providerProofMode && hasMedia && (
+      approvedMedia!.sha256 !== mediaSha256 || approvedMedia!.byteSize !== mediaByteSize
+      || approvedMedia!.mimeType !== mediaMimeType || approvedMedia!.container !== mediaContainer
+    ))
+    || providerResponseSha256 === undefined
+    || providerStatusReceiptSha256 === undefined
+  ) return { error: 'providerOperation contains malformed media or digest evidence' };
+
+  const sessionCreatedAt = timestampOrNull(record.sessionCreatedAt);
+  const uploadStartedAt = timestampOrNull(record.uploadStartedAt);
+  const uploadCompletedAt = timestampOrNull(record.uploadCompletedAt);
+  const lastReconciledAt = timestampOrNull(record.lastReconciledAt);
+  const acceptedByteOffset = safeCount(record.acceptedByteOffset, Number.MAX_SAFE_INTEGER);
+  const reconciliationAttemptCount = safeCount(record.reconciliationAttemptCount, 3);
+  const reconciliationAttemptBudget = safeCount(record.reconciliationAttemptBudget, 3);
+  const reconciliationFencingToken = safeCount(record.reconciliationFencingToken, Number.MAX_SAFE_INTEGER);
+  const reconciliationLease = parseReconciliationLease(record.reconciliationLease, providerOperationId);
+  const eventCount = safeCount(record.eventCount);
+  const externalVideoId = record.externalVideoId === null ? null : boundedString(record.externalVideoId, 128);
+  const lastOperationErrorCode = record.lastOperationErrorCode === null
+    ? null
+    : boundedString(record.lastOperationErrorCode, 120);
+  if (
+    sessionCreatedAt === undefined || uploadStartedAt === undefined || uploadCompletedAt === undefined
+    || lastReconciledAt === undefined || acceptedByteOffset === undefined
+    || reconciliationAttemptCount === undefined || reconciliationAttemptBudget === undefined
+    || reconciliationAttemptBudget !== 3
+    || reconciliationAttemptCount > reconciliationAttemptBudget
+    || reconciliationFencingToken === undefined || reconciliationLease === undefined
+    || (reconciliationLease !== null && reconciliationLease.fencingToken !== reconciliationFencingToken)
+    || (hasMedia && (acceptedByteOffset as number) > (mediaByteSize as number))
+    || eventCount === undefined || externalVideoId === undefined || lastOperationErrorCode === undefined
+    || typeof record.eventDigestSha256 !== 'string' || !SHA256_PATTERN.test(record.eventDigestSha256)
+  ) return { error: 'providerOperation contains malformed lifecycle evidence' };
+  const mutationSummary = parseProviderMutationSummary(record.mutationSummary);
+  if (!mutationSummary) return { error: 'providerOperation contains malformed mutation accounting' };
+  let providerStatusReceipt: AutoPosterProviderStatusReceiptView | null = null;
+  if (record.providerStatusReceipt !== null) {
+    if (!hasMedia || typeof mediaSha256 !== 'string') return { error: 'providerOperation receipt has no media binding' };
+    providerStatusReceipt = parseProviderReceipt(record.providerStatusReceipt, {
+      queueId: post.id,
+      providerOperationId,
+      providerAttemptId,
+      mediaSha256,
+      approvedMedia: approvedMedia as AutoPosterApprovedMediaIdentity | null,
+      providerProofMode,
+      userId: post.userId,
+      workspaceId: post.workspaceId,
+      runtimeMissionId: post.runtimeMissionId,
+      graphId: boundedString(record.graphId ?? '', 256) ?? '',
+      accountId: post.accountId,
+      connectedAccountId: post.connectedAccountId,
+    }) ?? null;
+    if (!providerStatusReceipt || !providerStatusReceiptSha256) {
+      return { error: 'providerOperation contains an unsafe provider receipt' };
+    }
+    if (canonicalSha256(providerStatusReceipt) !== providerStatusReceiptSha256) {
+      return { error: 'providerOperation receipt digest does not match the normalized receipt' };
+    }
+  } else if (providerStatusReceiptSha256 !== null) {
+    return { error: 'providerOperation contains a receipt hash without a receipt' };
+  }
+  if (
+    operationState === 'completed_private'
+    && (!providerStatusReceipt
+      || !providerStatusReceipt.artifactExists
+      || !providerStatusReceipt.exactTitleMatch
+      || providerStatusReceipt.privacyStatus !== 'private'
+      || providerStatusReceipt.verifiedChannelId !== post.accountId
+      || !completedPrivateStatusesAreCoherent(providerStatusReceipt))
+  ) return { error: 'providerOperation private completion is not proven by its receipt' };
+  if (
+    operationState === 'contradictory_public'
+    && (!providerStatusReceipt || !['public', 'unlisted'].includes(providerStatusReceipt.privacyStatus))
+  ) return { error: 'providerOperation visibility contradiction is not proven by its receipt' };
+
+  return {
+    value: {
+      schemaVersion: 'chanter.autoposter.youtube-provider-operation.v1',
+      providerOperationId,
+      providerAttemptId,
+      provider: 'youtube',
+      operationState: operationState as AutoPosterProviderOperationState,
+      queueId: post.id,
+      userId: post.userId,
+      workspaceId: post.workspaceId,
+      accountId: post.accountId,
+      connectedAccountId: post.connectedAccountId,
+      approvalActorId: boundedString(record.approvalActorId, 256) ?? '',
+      approvalTimestamp,
+      approvedAttemptNumber,
+      runtimeMissionId: post.runtimeMissionId,
+      graphId,
+      runtimeAction: post.runtimeAction,
+      runtimePayloadHash: post.runtimePayloadHash,
+      approvedMediaSha256: approvedMediaSha256 as string | null,
+      providerProofMode,
+      approvedMedia: approvedMedia as AutoPosterApprovedMediaIdentity | null,
+      bindingSha256: bindingSha256 as string | null,
+      mediaSha256: mediaSha256 as string | null,
+      mediaByteSize: mediaByteSize as number | null,
+      mediaMimeType: mediaMimeType as string | null,
+      mediaContainer: mediaContainer as string | null,
+      mediaFileName: mediaFileName as string | null,
+      mediaSourceId: mediaSourceId as string | null,
+      sessionCreatedAt, uploadStartedAt, uploadCompletedAt,
+      acceptedByteOffset,
+      externalVideoId,
+      providerResponseSha256,
+      providerStatusReceiptSha256,
+      providerStatusReceipt,
+      mutationSummary,
+      reconciliationAttemptCount,
+      reconciliationAttemptBudget,
+      reconciliationLease: reconciliationLease as AutoPosterReconciliationLeaseView | null,
+      reconciliationFencingToken,
+      lastReconciledAt,
+      lastOperationErrorCode,
+      eventCount,
+      eventDigestSha256: record.eventDigestSha256,
+    },
+  };
+}
+
 /**
  * Closed-world validation of one AutoPoster post-status response against the
  * exact request identity. Every field the view carries is validated and
@@ -517,6 +978,13 @@ function parsePostStatusView(value: unknown, params: AutoPosterPostStatusParams)
     return statusParseError(
       `AutoPoster returned a status response containing the unsafe field "${redactText(unsafeKey).slice(0, 40)}".`
     );
+  }
+  for (const key of Object.keys(post)) {
+    if (!POST_STATUS_TOP_LEVEL_KEYS.has(key)) {
+      return statusParseError(
+        `AutoPoster returned a status response containing the unexpected field "${redactText(key).slice(0, 40)}".`
+      );
+    }
   }
 
   const id = boundedString(post.id, 256);
@@ -665,6 +1133,52 @@ function parsePostStatusView(value: unknown, params: AutoPosterPostStatusParams)
   if ('error' in history) {
     return statusParseError(`AutoPoster returned unsafe history evidence: ${history.error}.`);
   }
+  const providerOperation = parseProviderOperation(post.providerOperation ?? null, {
+    id,
+    userId: params.userId,
+    provider,
+    workspaceId,
+    accountId,
+    connectedAccountId,
+    runtimeMissionId,
+    runtimeAction,
+    runtimePayloadHash,
+  });
+  if ('error' in providerOperation) {
+    return statusParseError(`AutoPoster returned unsafe provider-operation evidence: ${providerOperation.error}.`);
+  }
+  const operation = providerOperation.value;
+  if (provider === 'youtube' && operation) {
+    const receipt = operation.providerStatusReceipt;
+    if (operation.providerProofMode && (
+      !operation.approvedMedia
+      || !operation.graphId
+      || !operation.workspaceId
+      || !operation.runtimeMissionId
+      || !operation.runtimePayloadHash
+    )) return statusParseError('AutoPoster returned an incomplete provider-proof identity binding.');
+    if (operation.operationState === 'completed_private') {
+      if (
+        status !== 'posted'
+        || providerStatus !== 'uploaded_private'
+        || !publishId
+        || !receipt
+        || receipt.externalVideoId !== publishId
+        || operation.externalVideoId !== publishId
+        || !providerVerification.value
+        || providerVerification.value.externalVideoId !== publishId
+        || providerVerification.value.channelId !== receipt.verifiedChannelId
+        || providerVerification.value.title !== receipt.expectedTitle
+        || !completedPrivateStatusesAreCoherent(receipt, providerVerification.value)
+      ) return statusParseError('AutoPoster returned contradictory completed-private artifact identities.');
+    }
+    if (operation.operationState === 'contradictory_public' && (
+      status === 'posted' || providerStatus === 'uploaded_private'
+    )) return statusParseError('AutoPoster classified a visibility contradiction as success.');
+    if (operation.operationState === 'provider_missing' && (
+      status === 'posted' || providerStatus === 'uploaded_private' || Boolean(providerVerification.value)
+    )) return statusParseError('AutoPoster returned positive artifact proof for a provider-missing operation.');
+  }
 
   return {
     ok: true,
@@ -689,6 +1203,7 @@ function parsePostStatusView(value: unknown, params: AutoPosterPostStatusParams)
       publishId,
       providerStatus,
       providerVerification: providerVerification.value,
+      providerOperation: operation,
       lockedAt,
       claimAttempts: claimAttempts as number,
       publishAttemptBudget: publishAttemptBudget as number,
@@ -770,6 +1285,15 @@ export function createAutoPosterHttpPort(options: AutoPosterHttpPortOptions): Au
 
     const record = payload as Record<string, unknown>;
     if (!response.ok || record?.ok !== true) {
+      if (containsForbiddenProviderMaterial(record, [serviceToken])) {
+        const safeDetails = safeFailureDetails(record);
+        const safeCode = isCommercialDenial(response.status, safeDetails)
+          ? 'forbidden'
+          : typeof record?.code === 'string' && isPortErrorCode(record.code)
+            ? record.code
+            : statusToErrorCode(response.status);
+        return failure(safeCode, PROVIDER_DIAGNOSTIC_REDACTED_MESSAGE, safeDetails);
+      }
       const reason =
         typeof record?.reason === 'string'
           ? record.reason
@@ -782,7 +1306,10 @@ export function createAutoPosterHttpPort(options: AutoPosterHttpPortOptions): Au
         : typeof record?.code === 'string' && isPortErrorCode(record.code)
           ? record.code
           : statusToErrorCode(response.status);
-      return failure(code, redactText(`AutoPoster refused ${method} ${path}: ${reason}`).slice(0, 500), details);
+      return failure(code, safeProviderFailureMessage(
+        redactText(`AutoPoster refused ${method} ${path}: ${reason}`).slice(0, 500),
+        [serviceToken]
+      ), details);
     }
     return record as unknown as TSuccess;
   }
@@ -816,6 +1343,48 @@ export function createAutoPosterHttpPort(options: AutoPosterHttpPortOptions): Au
       }
       return { ok: true, post: parsed.view } satisfies AutoPosterPostStatusSuccess;
     },
+    async reconcileProviderOperation(params: AutoPosterProviderReconciliationParams) {
+      const result = await call<{ ok: true; classification?: unknown; post?: unknown }>(
+        'POST',
+        `/api/runtime/posts/${encodeURIComponent(params.postId)}/provider/reconcile`,
+        {
+          accountId: params.accountId,
+          ...(params.workspaceId ? { workspaceId: params.workspaceId } : {}),
+        }
+      );
+      if (!result.ok) return result;
+      const resultRecord = result as unknown as Record<string, unknown>;
+      if (
+        !Object.keys(resultRecord).every((key) => ['ok', 'classification', 'post'].includes(key))
+        || typeof result.classification !== 'string'
+        || !PROVIDER_RECONCILIATION_CLASSIFICATIONS.has(
+          result.classification as AutoPosterProviderReconciliationSuccess['classification']
+        )
+      ) {
+        return failure('invalid_response', 'AutoPoster returned an invalid provider reconciliation envelope.');
+      }
+      const parsed = parsePostStatusView(result.post, params);
+      if (!parsed.ok) {
+        return failure('invalid_response', parsed.message, {
+          reasonCode: parsed.identityMismatch
+            ? 'status_identity_mismatch'
+            : 'status_contract_violation',
+        });
+      }
+      if (
+        PROVIDER_OPERATION_STATES.has(result.classification as AutoPosterProviderOperationState)
+        && parsed.view.providerOperation?.operationState !== result.classification
+      ) {
+        return failure('invalid_response', 'AutoPoster reconciliation classification contradicts the provider-operation state.', {
+          reasonCode: 'status_contract_violation',
+        });
+      }
+      return {
+        ok: true,
+        classification: result.classification as AutoPosterProviderReconciliationSuccess['classification'],
+        post: parsed.view,
+      } satisfies AutoPosterProviderReconciliationSuccess;
+    },
     validateMedia(params: AutoPosterMediaValidationParams) {
       return call<AutoPosterMediaValidationSuccess>('POST', '/api/runtime/media/validate', { ...params });
     },
@@ -835,6 +1404,11 @@ export function createAutoPosterHttpPort(options: AutoPosterHttpPortOptions): Au
         missionId: params.missionId,
         action: params.action,
         missionPayloadHash: params.missionPayloadHash,
+        ...(params.graphId ? { graphId: params.graphId } : {}),
+        ...(params.providerProofMode ? {
+          providerProofMode: true,
+          approvedMedia: params.approvedMedia,
+        } : {}),
       }, params.traceId);
     },
     async reconcileSchedule(params: AutoPosterScheduleReconciliationParams) {
